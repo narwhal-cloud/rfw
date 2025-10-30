@@ -18,9 +18,11 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            arch: x86_64
+            cc: gcc
+            musl_target: x86_64-linux-musl
           - target: aarch64-unknown-linux-musl
-            arch: aarch64
+            cc: aarch64-linux-musl-gcc
+            musl_target: aarch64-linux-musl
 
     steps:
     - name: Checkout code
@@ -29,7 +31,14 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+        sudo apt-get install -y musl-tools wget
+
+    - name: Install aarch64-linux-musl-gcc
+      if: matrix.target == 'aarch64-unknown-linux-musl'
+      run: |
+        wget https://musl.cc/aarch64-linux-musl-cross.tgz
+        tar -xzf aarch64-linux-musl-cross.tgz -C $HOME
+        echo "$HOME/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
 
     - name: Install Rust toolchains
       run: |
@@ -42,6 +51,9 @@ jobs:
 
     - name: Build release binary
       run: cargo build --package rfw --release --target ${{ matrix.target }}
+      env:
+        CC: ${{ matrix.cc }}
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
 
     - name: Prepare binary
       run: |
@@ -95,10 +107,15 @@ jobs:
           Download the binary for your platform:
 
           ```bash
-          # For x86_64
+          # For x86_64 (Intel/AMD)
           wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/rfw-x86_64-unknown-linux-musl
           chmod +x rfw-x86_64-unknown-linux-musl
           sudo mv rfw-x86_64-unknown-linux-musl /usr/local/bin/rfw
+
+          # For ARM64 (Raspberry Pi, AWS Graviton, etc.)
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/rfw-aarch64-unknown-linux-musl
+          chmod +x rfw-aarch64-unknown-linux-musl
+          sudo mv rfw-aarch64-unknown-linux-musl /usr/local/bin/rfw
           ```
 
           ## Usage
@@ -120,7 +137,8 @@ jobs:
           - Root privileges to attach XDP programs
           - Network interface with XDP driver support
 
-          Verify checksums:
+          ## Verify checksums
+
           ```bash
           sha256sum -c checksums.txt
           ```
