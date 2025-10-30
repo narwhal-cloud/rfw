@@ -36,6 +36,10 @@ jobs:
         toolchain: nightly
         components: rust-src
 
+    - name: Install Rust targets
+      run: |
+        rustup +nightly target add bpfel-unknown-none
+
     - name: Install bpf-linker
       run: cargo install bpf-linker
 
@@ -79,11 +83,15 @@ jobs:
         toolchain: nightly
         components: rust-src
 
+    - name: Install Rust targets
+      run: |
+        rustup +nightly target add bpfel-unknown-none
+
     - name: Install bpf-linker
       run: cargo install bpf-linker
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Build eBPF program
-      run: cargo build --package rfw-ebpf --release
+    - name: Build eBPF program (via rfw build.rs)
+      run: cargo build --package rfw --release

@@ -42,11 +42,16 @@ jobs:
         toolchain: stable
         targets: ${{ matrix.target }}
 
-    - name: Setup Rust nightly toolchain
+    - name: Setup Rust nightly toolchain with rust-src
       uses: dtolnay/rust-toolchain@nightly
       with:
         toolchain: nightly
         components: rust-src
+
+    - name: Install Rust targets
+      run: |
+        rustup +stable target add ${{ matrix.target }}
+        rustup +nightly target add bpfel-unknown-none
 
     - name: Install bpf-linker
       run: cargo install bpf-linker
@@ -57,9 +62,11 @@ jobs:
         shared-key: "rfw-build-${{ matrix.target }}"
 
     - name: Build release binary (eBPF + userspace)
-      run: cargo build --package rfw --release --target ${{ matrix.target }}
+      run: |
+        cargo +stable build --package rfw --release --target ${{ matrix.target }}
       env:
         CC: ${{ matrix.arch == 'aarch64' && 'aarch64-linux-gnu-gcc' || 'gcc' }}
+        CARGO_CFG_BPF_TARGET_ARCH: ${{ matrix.arch }}
 
     - name: Prepare binary
       run: |
