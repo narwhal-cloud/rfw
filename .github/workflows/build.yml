@@ -31,14 +31,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y musl-tools wget
-
-    - name: Install aarch64-linux-musl-gcc
-      if: matrix.target == 'aarch64-unknown-linux-musl'
-      run: |
-        wget https://musl.cc/aarch64-linux-musl-cross.tgz
-        tar -xzf aarch64-linux-musl-cross.tgz -C $HOME
-        echo "$HOME/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+        sudo apt-get install -y musl-tools
 
     - name: Install Rust toolchains
       run: |
@@ -49,11 +42,17 @@ jobs:
     - name: Install bpf-linker
       run: cargo install bpf-linker
 
+    - name: Install cross for ARM64 build
+      if: matrix.target == 'aarch64-unknown-linux-musl'
+      run: cargo install cross --git https://github.com/cross-rs/cross
+
     - name: Build release binary
-      run: cargo build --package rfw --release --target ${{ matrix.target }}
-      env:
-        CC: ${{ matrix.cc }}
-        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+      run: |
+        if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+          cross build --package rfw --release --target ${{ matrix.target }}
+        else
+          cargo build --package rfw --release --target ${{ matrix.target }}
+        fi
 
     - name: Prepare binary
       run: |
