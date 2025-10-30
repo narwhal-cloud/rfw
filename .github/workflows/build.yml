@@ -1,0 +1,140 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          llvm \
+          clang \
+          linux-headers-$(uname -r) \
+          musl-tools \
+          gcc-aarch64-linux-gnu
+
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: ${{ matrix.target }}
+
+    - name: Install bpf-linker
+      run: cargo install bpf-linker --no-default-features
+
+    - name: Setup Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "rfw-build-${{ matrix.target }}"
+
+    - name: Build release binary (eBPF + userspace)
+      run: cargo build --package rfw --release --target ${{ matrix.target }}
+      env:
+        CC: ${{ matrix.arch == 'aarch64' && 'aarch64-linux-gnu-gcc' || 'gcc' }}
+
+    - name: Prepare binary
+      run: |
+        mkdir -p artifacts
+        cp target/${{ matrix.target }}/release/rfw artifacts/rfw-${{ matrix.target }}
+        chmod +x artifacts/rfw-${{ matrix.target }}
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: rfw-${{ matrix.target }}
+        path: artifacts/rfw-${{ matrix.target }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Create checksums
+      run: |
+        cd artifacts
+        for dir in */; do
+          cd "$dir"
+          sha256sum * > checksums.txt
+          cd ..
+        done
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/*/rfw-*
+          artifacts/*/checksums.txt
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+        body: |
+          ## Installation
+
+          Download the binary for your platform:
+
+          ```bash
+          # For x86_64
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/rfw-x86_64-unknown-linux-musl
+          chmod +x rfw-x86_64-unknown-linux-musl
+          sudo mv rfw-x86_64-unknown-linux-musl /usr/local/bin/rfw
+          ```
+
+          ## Usage
+
+          ```bash
+          # Basic usage - block all China inbound traffic
+          sudo rfw --iface eth0 --block-cn-all
+
+          # Block specific protocols from China
+          sudo rfw --iface eth0 --block-cn-http --block-cn-socks5
+
+          # Block email sending
+          sudo rfw --iface eth0 --block-email
+          ```
+
+          ## Requirements
+
+          - Linux kernel 5.15+ with XDP support
+          - Root privileges to attach XDP programs
+          - Network interface with XDP driver support
+
+          Verify checksums:
+          ```bash
+          sha256sum -c checksums.txt
+          ```
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
