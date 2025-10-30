@@ -29,44 +29,19 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          llvm \
-          clang \
-          linux-headers-$(uname -r) \
-          musl-tools \
-          gcc-aarch64-linux-gnu
+        sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
 
-    - name: Setup Rust stable toolchain
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: stable
-        targets: ${{ matrix.target }}
-
-    - name: Setup Rust nightly toolchain with rust-src
-      uses: dtolnay/rust-toolchain@nightly
-      with:
-        toolchain: nightly
-        components: rust-src
-
-    - name: Install Rust targets
+    - name: Install Rust toolchains
       run: |
-        rustup +stable target add ${{ matrix.target }}
-        rustup +nightly target add bpfel-unknown-none
+        rustup toolchain install stable
+        rustup toolchain install nightly --component rust-src
+        rustup target add --toolchain stable ${{ matrix.target }}
 
     - name: Install bpf-linker
       run: cargo install bpf-linker
 
-    - name: Setup Rust cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        shared-key: "rfw-build-${{ matrix.target }}"
-
-    - name: Build release binary (eBPF + userspace)
-      run: |
-        cargo +stable build --package rfw --release --target ${{ matrix.target }}
-      env:
-        CC: ${{ matrix.arch == 'aarch64' && 'aarch64-linux-gnu-gcc' || 'gcc' }}
-        CARGO_CFG_BPF_TARGET_ARCH: ${{ matrix.arch }}
+    - name: Build release binary
+      run: cargo build --package rfw --release --target ${{ matrix.target }}
 
     - name: Prepare binary
       run: |
