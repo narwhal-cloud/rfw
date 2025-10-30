@@ -24,14 +24,20 @@ jobs:
           clang \
           linux-headers-$(uname -r)
 
-    - name: Setup Rust toolchain
+    - name: Setup Rust stable toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: stable
         components: rustfmt, clippy
 
+    - name: Setup Rust nightly toolchain
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        toolchain: nightly
+        components: rust-src
+
     - name: Install bpf-linker
-      run: cargo install bpf-linker --no-default-features
+      run: cargo install bpf-linker
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
@@ -62,13 +68,19 @@ jobs:
           clang \
           linux-headers-$(uname -r)
 
-    - name: Setup Rust toolchain
+    - name: Setup Rust stable toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: stable
 
+    - name: Setup Rust nightly toolchain
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        toolchain: nightly
+        components: rust-src
+
     - name: Install bpf-linker
-      run: cargo install bpf-linker --no-default-features
+      run: cargo install bpf-linker
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
