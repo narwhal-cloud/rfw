@@ -5,12 +5,12 @@ passthrough = [
 
 [target.x86_64-unknown-linux-musl]
 pre-build = [
-    ". $HOME/.cargo/env && rustup toolchain install nightly --component rust-src",
-    ". $HOME/.cargo/env && cargo install bpf-linker --locked",
+    "PATH=/root/.cargo/bin:$PATH rustup toolchain install nightly --component rust-src",
+    "PATH=/root/.cargo/bin:$PATH cargo install bpf-linker --locked",
 ]
 
 [target.aarch64-unknown-linux-musl]
 pre-build = [
-    ". $HOME/.cargo/env && rustup toolchain install nightly --component rust-src",
-    ". $HOME/.cargo/env && cargo install bpf-linker --locked",
+    "PATH=/root/.cargo/bin:$PATH rustup toolchain install nightly --component rust-src",
+    "PATH=/root/.cargo/bin:$PATH cargo install bpf-linker --locked",
 ]
