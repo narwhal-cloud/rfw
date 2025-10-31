@@ -36,23 +36,14 @@ jobs:
     - name: Install Rust toolchains
       run: |
         rustup toolchain install stable
-        rustup toolchain install nightly --component rust-src
         rustup target add --toolchain stable ${{ matrix.target }}
 
-    - name: Install bpf-linker
-      run: cargo install bpf-linker
-
-    - name: Install cross for ARM64 build
-      if: matrix.target == 'aarch64-unknown-linux-musl'
+    - name: Install cross
       run: cargo install cross --git https://github.com/cross-rs/cross
 
     - name: Build release binary
       run: |
-        if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-          cross build --package rfw --release --target ${{ matrix.target }}
-        else
-          cargo build --package rfw --release --target ${{ matrix.target }}
-        fi
+        cross build --package rfw --release --target ${{ matrix.target }}
 
     - name: Prepare binary
       run: |
