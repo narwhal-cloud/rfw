@@ -49,6 +49,7 @@ jobs:
       run: cargo build --package rfw --release --target ${{ matrix.target }}
       env:
         CC: ${{ matrix.target == 'aarch64-unknown-linux-musl' && 'aarch64-linux-gnu-gcc' || 'musl-gcc' }}
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
 
     - name: Prepare binary
       run: |
