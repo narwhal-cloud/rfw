@@ -16,20 +16,39 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-musl
+            musl_target: x86_64-linux-musl
+          - target: aarch64-unknown-linux-musl
+            musl_target: aarch64-linux-musl
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v5
 
-    - name: Install cross
-      run: cargo install cross --git https://github.com/cross-rs/cross
+    - name: Install musl tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools
+
+    - name: Install musl cross compiler
+      if: matrix.target == 'aarch64-unknown-linux-musl'
+      run: |
+        sudo apt-get install -y gcc-aarch64-linux-gnu
+
+    - name: Install Rust toolchains
+      run: |
+        rustup toolchain install stable
+        rustup toolchain install nightly --component rust-src
+        rustup target add --toolchain stable ${{ matrix.target }}
+
+    - name: Install bpf-linker
+      run: cargo install bpf-linker --locked
 
     - name: Build release binary
-      run: |
-        cross build --package rfw --release --target ${{ matrix.target }}
+      run: cargo build --package rfw --release --target ${{ matrix.target }}
+      env:
+        CC: ${{ matrix.target == 'aarch64-unknown-linux-musl' && 'aarch64-linux-gnu-gcc' || 'musl-gcc' }}
 
     - name: Prepare binary
       run: |
