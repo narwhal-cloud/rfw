@@ -16,27 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            cc: gcc
-            musl_target: x86_64-linux-musl
-          - target: aarch64-unknown-linux-musl
-            cc: aarch64-linux-musl-gcc
-            musl_target: aarch64-linux-musl
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y musl-tools
-
-    - name: Install Rust toolchains
-      run: |
-        rustup toolchain install stable
-        rustup target add --toolchain stable ${{ matrix.target }}
+      uses: actions/checkout@v5
 
     - name: Install cross
       run: cargo install cross --git https://github.com/cross-rs/cross
@@ -52,7 +38,7 @@ jobs:
         chmod +x artifacts/rfw-${{ matrix.target }}
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: rfw-${{ matrix.target }}
         path: artifacts/rfw-${{ matrix.target }}
@@ -66,10 +52,10 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: Download all artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         path: artifacts
 
@@ -83,7 +69,7 @@ jobs:
         done
 
     - name: Create Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: |
           artifacts/*/rfw-*
