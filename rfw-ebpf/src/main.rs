@@ -4,7 +4,7 @@
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::{lpm_trie::Key, Array, LpmTrie, LruHashMap},
+    maps::{Array, LpmTrie, LruHashMap, lpm_trie::Key},
     programs::XdpContext,
 };
 use aya_log_ebpf::{debug, info};
@@ -78,6 +78,10 @@ struct TcpHdr {
     urg_ptr: u16,
 }
 
+// TCP flags (in network byte order, lower byte of _bitfield)
+const TCP_SYN: u8 = 0x02;
+const TCP_PSH: u8 = 0x08;
+
 // HTTP 方法字符串（前4个字节）
 const HTTP_GET: u32 = 0x47455420; // "GET "
 const HTTP_POST: u32 = 0x504f5354; // "POST"
@@ -108,9 +112,10 @@ const IPPROTO_UDP: u8 = 17;
 const RULE_BLOCK_EMAIL: u32 = 1 << 0;
 const RULE_BLOCK_CN_HTTP: u32 = 1 << 1;
 const RULE_BLOCK_CN_SOCKS5: u32 = 1 << 2;
-const RULE_BLOCK_CN_FET: u32 = 1 << 3;
+const RULE_BLOCK_CN_FET_STRICT: u32 = 1 << 3; // FET 严格模式（默认阻止）
 const RULE_BLOCK_CN_WIREGUARD: u32 = 1 << 4;
 const RULE_BLOCK_CN_ALL: u32 = 1 << 5;
+const RULE_BLOCK_CN_FET_LOOSE: u32 = 1 << 6; // FET 宽松模式（默认放过）
 
 // WireGuard 协议常量
 const WG_TYPE_HANDSHAKE_INIT: u8 = 1;
@@ -159,7 +164,11 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
     // 检查是否启用了屏蔽中国所有入站流量规则
     if (*config_flags & RULE_BLOCK_CN_ALL) != 0 {
         if is_cn_ip(src_ip)? {
-            info!(&ctx, "BLOCKED: 所有入站流量来自中国 IP: {:i}", src_ip);
+            info!(
+                &ctx,
+                "BLOCKED: 所有入站流量来自中国 IP: {:i}",
+                u32::from_be(src_ip)
+            );
             return Ok(xdp_action::XDP_DROP);
         }
     }
@@ -198,14 +207,49 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
             // 协议深度检测（HTTP/SOCKS5/FET）- 使用连接跟踪避免误判
             // 检查是否启用了任何需要协议检测的规则
             let needs_protocol_detection = (*config_flags
-                & (RULE_BLOCK_CN_HTTP | RULE_BLOCK_CN_SOCKS5 | RULE_BLOCK_CN_FET))
+                & (RULE_BLOCK_CN_HTTP
+                    | RULE_BLOCK_CN_SOCKS5
+                    | RULE_BLOCK_CN_FET_STRICT
+                    | RULE_BLOCK_CN_FET_LOOSE))
                 != 0;
 
             unsafe {
                 if needs_protocol_detection {
-                    // 构造连接五元组 key
+                    // 优化：先检查是否是中国IP，非中国IP直接跳过协议检测
+                    // LpmTrie 查找很快（O(1)），而协议检测较慢
+                    if !is_cn_ip(src_ip)? {
+                        // 不是中国IP，直接放行，不需要协议检测
+                        return Ok(xdp_action::XDP_PASS);
+                    }
+                    // 确认是中国IP，继续进行协议检测
                     let src_port = u16::from_be((*tcp_hdr).source);
                     let dst_ip = (*ip_hdr).daddr;
+
+                    // 提取TCP flags（_bitfield的低8位）
+                    let tcp_flags = (u16::from_be((*tcp_hdr)._bitfield) & 0xFF) as u8;
+
+                    // 跳过TCP握手包（SYN或SYN-ACK）
+                    if (tcp_flags & TCP_SYN) != 0 {
+                        debug!(&ctx, "跳过协议检测: TCP握手包 (含SYN)");
+                        return Ok(xdp_action::XDP_PASS);
+                    }
+
+                    // 检查是否有实际的TCP payload
+                    let start = ctx.data();
+                    let end = ctx.data_end();
+                    let payload_size = end.saturating_sub(start + payload_offset);
+
+                    // 没有payload，跳过检测（例如纯ACK包）
+                    if payload_size == 0 {
+                        return Ok(xdp_action::XDP_PASS);
+                    }
+
+                    // 关键：只对带PSH标志的包进行协议检测
+                    // HTTP/SOCKS5等应用层协议必然会设置PSH标志
+                    // 纯ACK包即使有payload也可能是TCP窗口更新等控制信息
+                    if (tcp_flags & TCP_PSH) == 0 {
+                        return Ok(xdp_action::XDP_PASS);
+                    }
 
                     let conn_key = ConnKey {
                         src_ip,
@@ -221,89 +265,92 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                         Some(&state) => {
                             // 连接已被检测过
                             if state == CONN_STATE_BLOCKED {
-                                // 这个连接已被标记为阻止，直接DROP所有后续包
-                                debug!(
-                                    &ctx,
-                                    "BLOCKED: 已阻止连接的后续包, 源IP: {:i}",
-                                    src_ip
-                                );
                                 return Ok(xdp_action::XDP_DROP);
                             }
-                            // state == CONN_STATE_ALLOWED, 直接放行
                         }
                         None => {
-                            // 新连接，需要进行协议检测
-                            // 检查是否有TCP payload
-                            let start = ctx.data();
-                            let end = ctx.data_end();
-                            let payload_size = end.saturating_sub(start + payload_offset);
+                            debug!(
+                                &ctx,
+                                "CHECK: 中国IP入站, 源 {:i}:{} -> 目标端口 {}, payload={}字节, offset={}",
+                                u32::from_be(src_ip),
+                                src_port,
+                                dst_port,
+                                payload_size,
+                                payload_offset
+                            );
 
-                            // 只有当有payload时才进行检测
-                            if payload_size > 0 {
-                                let mut should_block = false;
+                            // 新连接，需要进行协议检测（已确保有payload）
+                            let mut should_block = false;
 
-                                // 检查 HTTP 入站屏蔽规则
-                                if (*config_flags & RULE_BLOCK_CN_HTTP) != 0 && payload_size >= 4 {
-                                    if is_http_request(&ctx, payload_offset)? {
-                                        if is_cn_ip(src_ip)? {
-                                            info!(
-                                                &ctx,
-                                                "BLOCKED: HTTP 入站流量来自中国 IP: {:i}",
-                                                src_ip
-                                            );
-                                            should_block = true;
-                                        }
-                                    }
-                                }
-
-                                // 检查 SOCKS5 入站屏蔽规则
-                                if !should_block
-                                    && (*config_flags & RULE_BLOCK_CN_SOCKS5) != 0
-                                    && payload_size >= 2
-                                {
-                                    if is_socks5_request(&ctx, payload_offset)? {
-                                        if is_cn_ip(src_ip)? {
-                                            info!(
-                                                &ctx,
-                                                "BLOCKED: SOCKS5 入站流量来自中国 IP: {:i}",
-                                                src_ip
-                                            );
-                                            should_block = true;
-                                        }
-                                    }
-                                }
-
-                                // 检查 FET（全加密流量）入站屏蔽规则
-                                // FET 检测需要至少 16 字节
-                                if !should_block
-                                    && (*config_flags & RULE_BLOCK_CN_FET) != 0
-                                    && payload_size >= 16
-                                {
-                                    if is_fully_encrypted_traffic(&ctx, payload_offset, payload_size)? {
-                                        if is_cn_ip(src_ip)? {
-                                            info!(
-                                                &ctx,
-                                                "BLOCKED: 全加密流量 (FET) 入站来自中国 IP: {:i}",
-                                                src_ip
-                                            );
-                                            should_block = true;
-                                        }
-                                    }
-                                }
-
-                                // 处理检测结果
-                                if should_block {
-                                    // 标记这个连接为已阻止，后续包也会被DROP
-                                    let _ =
-                                        TCP_CONN_TRACKER.insert(&conn_key, &CONN_STATE_BLOCKED, 0);
-                                    return Ok(xdp_action::XDP_DROP);
-                                } else {
-                                    // 标记这个连接为已通过，后续包直接放行
-                                    let _ =
-                                        TCP_CONN_TRACKER.insert(&conn_key, &CONN_STATE_ALLOWED, 0);
+                            // 检查 HTTP 入站屏蔽规则
+                            if (*config_flags & RULE_BLOCK_CN_HTTP) != 0 && payload_size >= 4 {
+                                if is_http_request(&ctx, payload_offset)? {
+                                    info!(
+                                        &ctx,
+                                        "BLOCKED: HTTP 入站流量来自中国, 源 {:i}:{} -> 目标端口 {}",
+                                        u32::from_be(src_ip),
+                                        src_port,
+                                        dst_port
+                                    );
+                                    should_block = true;
                                 }
                             }
-                            // 如果没有payload，不记录状态，等待有payload的包
+
+                            // 检查 SOCKS5 入站屏蔽规则
+                            if !should_block
+                                && (*config_flags & RULE_BLOCK_CN_SOCKS5) != 0
+                                && payload_size >= 2
+                            {
+                                if is_socks5_request(&ctx, payload_offset)? {
+                                    info!(
+                                        &ctx,
+                                        "BLOCKED: SOCKS5 入站流量来自中国, 源 {:i}:{} -> 目标端口 {}",
+                                        u32::from_be(src_ip),
+                                        src_port,
+                                        dst_port
+                                    );
+                                    should_block = true;
+                                }
+                            }
+
+                            // 检查 FET（全加密流量）入站屏蔽规则
+                            // FET 检测需要至少 16 字节
+                            if !should_block && payload_size >= 16 {
+                                // 判断模式：严格或宽松
+                                let strict_mode = (*config_flags & RULE_BLOCK_CN_FET_STRICT) != 0;
+                                let loose_mode = (*config_flags & RULE_BLOCK_CN_FET_LOOSE) != 0;
+
+                                if strict_mode || loose_mode {
+                                    if is_fully_encrypted_traffic(
+                                        &ctx,
+                                        payload_offset,
+                                        payload_size,
+                                        strict_mode,
+                                    )? {
+                                        let mode_str =
+                                            if strict_mode { "严格" } else { "宽松" };
+                                        info!(
+                                            &ctx,
+                                            "BLOCKED: 全加密流量 (FET-{}) 入站来自中国, 源 {:i}:{} -> 目标端口 {}",
+                                            mode_str,
+                                            u32::from_be(src_ip),
+                                            src_port,
+                                            dst_port
+                                        );
+                                        should_block = true;
+                                    }
+                                }
+                            }
+
+                            // 处理检测结果
+                            if should_block {
+                                // 标记这个连接为已阻止，后续包也会被DROP
+                                let _ = TCP_CONN_TRACKER.insert(&conn_key, &CONN_STATE_BLOCKED, 0);
+                                return Ok(xdp_action::XDP_DROP);
+                            } else {
+                                // 标记这个连接为已通过，后续包直接放行
+                                let _ = TCP_CONN_TRACKER.insert(&conn_key, &CONN_STATE_ALLOWED, 0);
+                            }
                         }
                     }
                 }
@@ -311,7 +358,7 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
         }
         IPPROTO_UDP => {
             // 处理 UDP 协议
-            let _udp_hdr = ptr_at::<UdpHdr>(&ctx, size_of::<EthHdr>() + ip_hdr_len)?;
+            let udp_hdr = ptr_at::<UdpHdr>(&ctx, size_of::<EthHdr>() + ip_hdr_len)?;
 
             // UDP payload 的起始位置
             let payload_offset = size_of::<EthHdr>() + ip_hdr_len + size_of::<UdpHdr>();
@@ -321,9 +368,14 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                 // 通过协议深度检测识别 WireGuard 流量
                 if is_wireguard_packet(&ctx, payload_offset)? {
                     if is_cn_ip(src_ip)? {
+                        let src_port = u16::from_be(unsafe { (*udp_hdr).source });
+                        let dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
                         info!(
                             &ctx,
-                            "BLOCKED: WireGuard VPN 入站流量来自中国 IP: {:i}", src_ip
+                            "BLOCKED: WireGuard VPN 入站流量来自中国, 源 {:i}:{} -> 目标端口 {}",
+                            u32::from_be(src_ip),
+                            src_port,
+                            dst_port
                         );
                         return Ok(xdp_action::XDP_DROP);
                     }
@@ -336,28 +388,65 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
     Ok(xdp_action::XDP_PASS)
 }
 
-// 检测是否为 HTTP 请求
-// 检查 TCP payload 开头是否包含 HTTP 方法
-fn is_http_request(ctx: &XdpContext, payload_offset: usize) -> Result<bool, ()> {
-    // 尝试读取前4个字节来检测 HTTP 方法
-    let method_bytes = match ptr_at::<u32>(ctx, payload_offset) {
+// 检测是否为 TLS 流量
+// TLS 握手格式：[\x16-\x17]\x03[\x00-\x09]
+#[inline(always)]
+fn is_tls(ctx: &XdpContext, payload_offset: usize) -> Result<bool, ()> {
+    // 读取前3个字节
+    let bytes = match ptr_at::<[u8; 3]>(ctx, payload_offset) {
         Ok(ptr) => unsafe { *ptr },
-        Err(_) => return Ok(false), // payload 太小，不是 HTTP
+        Err(_) => return Ok(false),
     };
 
-    // 检查是否匹配常见的 HTTP 方法
-    // 注意：这里的字节序是网络字节序（大端）
-    let method_be = u32::from_be(method_bytes);
+    // TLS: [\x16-\x17]\x03[\x00-\x09]
+    if bytes[0] >= 0x16 && bytes[0] <= 0x17 && bytes[1] == 0x03 && bytes[2] <= 0x09 {
+        return Ok(true);
+    }
 
-    if method_be == HTTP_GET
-        || method_be == HTTP_POST
-        || method_be == HTTP_HEAD
-        || method_be == HTTP_PUT
-        || method_be == HTTP_DELETE
-        || method_be == HTTP_OPTIONS
-        || method_be == HTTP_PATCH
-        || method_be == HTTP_CONNECT
+    Ok(false)
+}
+
+// 检测是否为 HTTP 请求
+// 检查 TCP payload 开头是否包含 HTTP 方法
+#[inline(always)]
+fn is_http_request(ctx: &XdpContext, payload_offset: usize) -> Result<bool, ()> {
+    // 尝试读取前4个字节来检测 HTTP 方法
+    let method_bytes = match ptr_at::<[u8; 4]>(ctx, payload_offset) {
+        Ok(ptr) => unsafe { *ptr },
+        Err(_) => {
+            debug!(&ctx, "HTTP检测: payload太小");
+            return Ok(false);
+        }
+    };
+
+    debug!(
+        &ctx,
+        "HTTP检测: 读取字节 [{:x} {:x} {:x} {:x}]",
+        method_bytes[0],
+        method_bytes[1],
+        method_bytes[2],
+        method_bytes[3]
+    );
+
+    // 构造u32进行比较（大端）
+    let method_u32 = ((method_bytes[0] as u32) << 24)
+        | ((method_bytes[1] as u32) << 16)
+        | ((method_bytes[2] as u32) << 8)
+        | (method_bytes[3] as u32);
+
+    debug!(&ctx, "HTTP检测: method_u32 = {:x}", method_u32);
+
+    // 检查是否匹配常见的 HTTP 方法
+    if method_u32 == HTTP_GET
+        || method_u32 == HTTP_POST
+        || method_u32 == HTTP_HEAD
+        || method_u32 == HTTP_PUT
+        || method_u32 == HTTP_DELETE
+        || method_u32 == HTTP_OPTIONS
+        || method_u32 == HTTP_PATCH
+        || method_u32 == HTTP_CONNECT
     {
+        debug!(&ctx, "HTTP检测: 匹配成功!");
         return Ok(true);
     }
 
@@ -403,8 +492,8 @@ fn is_cn_ip(ip: u32) -> Result<bool, ()> {
 
     // 进行最长前缀匹配查询
     match GEOIP_CN.get(&key) {
-        Some(&1) => Ok(true),  // 找到匹配的中国IP前缀
-        _ => Ok(false),        // 未找到或不是中国IP
+        Some(&1) => Ok(true), // 找到匹配的中国IP前缀
+        _ => Ok(false),       // 未找到或不是中国IP
     }
 }
 
@@ -422,37 +511,84 @@ macro_rules! byte_popcount {
     ($b:expr) => {{
         let mut count = 0u32;
         let mut byte = $b;
-        count += (byte & 1) as u32; byte >>= 1;
-        count += (byte & 1) as u32; byte >>= 1;
-        count += (byte & 1) as u32; byte >>= 1;
-        count += (byte & 1) as u32; byte >>= 1;
-        count += (byte & 1) as u32; byte >>= 1;
-        count += (byte & 1) as u32; byte >>= 1;
-        count += (byte & 1) as u32; byte >>= 1;
+        count += (byte & 1) as u32;
+        byte >>= 1;
+        count += (byte & 1) as u32;
+        byte >>= 1;
+        count += (byte & 1) as u32;
+        byte >>= 1;
+        count += (byte & 1) as u32;
+        byte >>= 1;
+        count += (byte & 1) as u32;
+        byte >>= 1;
+        count += (byte & 1) as u32;
+        byte >>= 1;
+        count += (byte & 1) as u32;
+        byte >>= 1;
         count += (byte & 1) as u32;
         count
     }};
 }
 
-// Ex2+Ex1 组合：检查前 16 字节的特征
-// 返回 (前6字节是否都可打印, 平均popcount*100)
+// FET (Fully Encrypted Traffic) 检测 - 简化版本
+// 只读取16字节，根据严格/宽松模式决定默认行为
+//
+// 检测逻辑：
+// 1. TLS/HTTP 豁免（Ex5）- 复用公共方法
+// 2. 前6字节可打印性豁免（Ex2）
+// 3. 熵值检测（Ex1，通过 popcount）
+// 4. 严格模式：默认阻止 | 宽松模式：默认放过
 #[inline(always)]
-fn check_first_16_bytes(ctx: &XdpContext, payload_offset: usize) -> Result<(bool, u32), ()> {
-    // 尝试读取前 16 字节
+fn is_fully_encrypted_traffic(
+    ctx: &XdpContext,
+    payload_offset: usize,
+    payload_len: usize,
+    strict_mode: bool,
+) -> Result<bool, ()> {
+    // 至少需要16字节
+    if payload_len < 16 {
+        debug!(&ctx, "不足16字节");
+        return Ok(strict_mode);
+    }
+
+    // Ex5: TLS 豁免检测
+    if is_tls(ctx, payload_offset)? {
+        debug!(&ctx, "tls");
+        return Ok(false);
+    }
+
+    // Ex5: HTTP 豁免检测
+    if is_http_request(ctx, payload_offset)? {
+        debug!(&ctx, "http");
+        return Ok(false);
+    }
+
+    // 读取前16字节用于后续检测
     let bytes = match ptr_at::<[u8; 16]>(ctx, payload_offset) {
         Ok(ptr) => unsafe { *ptr },
-        Err(_) => return Ok((false, 0)),
+        Err(_) => return Ok(false),
     };
 
-    // 检查前 6 字节是否都可打印（Ex2）
-    let all_printable = bytes[0] >= 0x20 && bytes[0] <= 0x7e
-        && bytes[1] >= 0x20 && bytes[1] <= 0x7e
-        && bytes[2] >= 0x20 && bytes[2] <= 0x7e
-        && bytes[3] >= 0x20 && bytes[3] <= 0x7e
-        && bytes[4] >= 0x20 && bytes[4] <= 0x7e
-        && bytes[5] >= 0x20 && bytes[5] <= 0x7e;
+    // Ex2: 检查前6字节是否都是可打印字符
+    let all_printable = bytes[0] >= 0x20
+        && bytes[0] <= 0x7e
+        && bytes[1] >= 0x20
+        && bytes[1] <= 0x7e
+        && bytes[2] >= 0x20
+        && bytes[2] <= 0x7e
+        && bytes[3] >= 0x20
+        && bytes[3] <= 0x7e
+        && bytes[4] >= 0x20
+        && bytes[4] <= 0x7e
+        && bytes[5] >= 0x20
+        && bytes[5] <= 0x7e;
 
-    // 计算 16 字节的总 popcount（Ex1）- 完全展开，无循环
+    if all_printable {
+        debug!(&ctx, "文本");
+        return Ok(false); // 豁免：可能是文本协议
+    }
+
+    // Ex1: 计算平均 popcount（熵值检测）
     let total_popcount = byte_popcount!(bytes[0])
         + byte_popcount!(bytes[1])
         + byte_popcount!(bytes[2])
@@ -470,78 +606,19 @@ fn check_first_16_bytes(ctx: &XdpContext, payload_offset: usize) -> Result<(bool
         + byte_popcount!(bytes[14])
         + byte_popcount!(bytes[15]);
 
-    // 平均 popcount * 100 / 16 字节 = total * 100 / 16
+    // 平均 popcount * 100（避免浮点运算）
     let avg_popcount_x100 = (total_popcount * 100) / 16;
 
-    Ok((all_printable, avg_popcount_x100))
-}
-
-// Ex5: 检查是否是 TLS 或 HTTP 流量
-#[inline(always)]
-fn is_tls_or_http(ctx: &XdpContext, payload_offset: usize) -> Result<bool, ()> {
-    // 检查至少有3个字节
-    match ptr_at::<[u8; 3]>(ctx, payload_offset) {
-        Ok(ptr) => {
-            let bytes = unsafe { *ptr };
-
-            // TLS: [\x16-\x17]\x03[\x00-\x09]
-            if bytes[0] >= 0x16 && bytes[0] <= 0x17
-                && bytes[1] == 0x03
-                && bytes[2] <= 0x09 {
-                return Ok(true);
-            }
-
-            // HTTP 方法检测（复用已有的函数）
-            if is_http_request(ctx, payload_offset)? {
-                return Ok(true);
-            }
-
-            Ok(false)
-        }
-        Err(_) => Ok(false),
-    }
-}
-
-// FET 检测主函数
-// 如果返回 true，表示检测到全加密流量（应该阻止）
-//
-// 简化策略（避免循环导致指令爆炸）：
-// - 只检查前 16 字节
-// - Ex5: TLS/HTTP 检测（3字节）- 最快排除合法流量
-// - Ex2: 前6字节可打印性（无循环）
-// - Ex1: 平均 popcount（16字节，无循环）
-#[inline(always)]
-fn is_fully_encrypted_traffic(ctx: &XdpContext, payload_offset: usize, payload_len: usize) -> Result<bool, ()> {
-    // 需要至少 16 个字节才能进行准确检测
-    if payload_len < 16 {
-        return Ok(false);
-    }
-
-    // Ex5: 优先检查是否是 TLS 或 HTTP（最快豁免）
-    if is_tls_or_http(ctx, payload_offset)? {
-        return Ok(false); // 豁免 TLS/HTTPS/HTTP
-    }
-
-    // Ex2 + Ex1: 检查前 16 字节的统计特征
-    let (all_printable, avg_popcount_x100) = check_first_16_bytes(ctx, payload_offset)?;
-
-    // Ex2: 如果前 6 字节都是可打印字符，豁免（可能是文本协议）
-    if all_printable {
-        return Ok(false);
-    }
-
-    // Ex1: 检查平均 popcount
-    // 正常范围是 3.4 到 4.6，即 340 到 460（* 100后）
-    // 全加密流量的 popcount 应该接近 4.0 (400)
+    // 熵值异常豁免：不在 3.4-4.6 范围内（340-460）
     if avg_popcount_x100 <= 340 || avg_popcount_x100 >= 460 {
-        return Ok(false); // 豁免
+        debug!(&ctx, "熵值异常");
+        return Ok(false); // 豁免：熵值异常
     }
 
-    // 所有豁免条件都不满足，判定为全加密流量
-    // - 不是 TLS/HTTP (Ex5)
-    // - 平均 popcount 在 3.4-4.6 范围内 (Ex1) - 高熵值
-    // - 前6字节不全是可打印字符 (Ex2) - 不是文本协议
-    Ok(true)
+    // 所有豁免条件都不满足
+    // 严格模式：判定为全加密流量（阻止）
+    // 宽松模式：默认放过
+    Ok(strict_mode)
 }
 
 // 检测是否为 WireGuard VPN 数据包

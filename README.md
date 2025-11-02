@@ -75,9 +75,8 @@ sudo ./target/release/rfw --iface eth0 \
   --block-email \
   --block-cn-http \
   --block-cn-socks5 \
-  --block-cn-fet \
-  --block-cn-wg \
-  --block-cn-all
+  --block-cn-fet-strict \
+  --block-cn-wg
 
 # 启用详细日志
 sudo RUST_LOG=info ./target/release/rfw --iface eth0 --block-cn-wg
@@ -137,7 +136,7 @@ sudo ./target/release/rfw --iface eth0 --block-cn-socks5
 #### 4. 屏蔽中国 IP 的全加密流量入站
 
 ```bash
-sudo ./target/release/rfw --iface eth0 --block-cn-fet
+sudo ./target/release/rfw --iface eth0 --block-cn-fet-strict
 ```
 
 阻止来自中国 IP 的全加密代理流量（Shadowsocks、V2Ray 等）
@@ -192,15 +191,14 @@ sudo ./target/release/rfw --iface eth0 \
   --block-email \
   --block-cn-http \
   --block-cn-socks5 \
-  --block-cn-fet \
+  --block-cn-fet-strict \
   --block-cn-wg \
-  --block-cn-all
 
 # 仅启用 GeoIP 相关规则
 sudo ./target/release/rfw --iface eth0 \
   --block-cn-http \
   --block-cn-socks5 \
-  --block-cn-fet \
+  --block-cn-fet-strict \
   --block-cn-wg
 
 # 仅启用协议检测规则（HTTP + SOCKS5）
@@ -210,7 +208,7 @@ sudo ./target/release/rfw --iface eth0 \
 
 # 仅启用全加密流量检测
 sudo ./target/release/rfw --iface eth0 \
-  --block-cn-fet
+  --block-cn-fet-strict
 
 # 仅启用 WireGuard VPN 检测
 sudo ./target/release/rfw --iface eth0 \
@@ -319,7 +317,7 @@ sudo ./target/release/rfw --iface eth0
 sudo ./target/release/rfw --iface eth0 --block-email --block-cn-http
 
 # 查看日志
-sudo RUST_LOG=info ./target/release/rfw --iface eth0 --block-cn-fet
+sudo RUST_LOG=info ./target/release/rfw --iface eth0 --block-cn-fet-strict
 ```
 
 ## 参考资料

@@ -97,9 +97,15 @@ struct Opt {
     #[clap(long)]
     block_cn_socks5: bool,
 
-    /// 屏蔽来自中国的全加密流量 (Fully Encrypted Traffic) 入站
+    /// 屏蔽来自中国的全加密流量 (Fully Encrypted Traffic) 入站 - 严格模式
+    /// 严格模式：不满足豁免条件的流量默认阻止
     #[clap(long)]
-    block_cn_fet: bool,
+    block_cn_fet_strict: bool,
+
+    /// 屏蔽来自中国的全加密流量 (Fully Encrypted Traffic) 入站 - 宽松模式
+    /// 宽松模式：不满足豁免条件的流量默认放过（降低误判）
+    #[clap(long)]
+    block_cn_fet_loose: bool,
 
     /// 屏蔽来自中国的 WireGuard VPN 入站
     #[clap(long)]
@@ -166,9 +172,13 @@ async fn main() -> anyhow::Result<()> {
         config_flags |= rfw_common::RULE_BLOCK_CN_SOCKS5;
         info!("启用规则: 屏蔽中国 IP 的 SOCKS5 入站");
     }
-    if opt.block_cn_fet {
-        config_flags |= rfw_common::RULE_BLOCK_CN_FET;
-        info!("启用规则: 屏蔽中国 IP 的全加密流量入站");
+    if opt.block_cn_fet_strict {
+        config_flags |= rfw_common::RULE_BLOCK_CN_FET_STRICT;
+        info!("启用规则: 屏蔽中国 IP 的全加密流量入站 (严格模式 - 默认阻止)");
+    }
+    if opt.block_cn_fet_loose {
+        config_flags |= rfw_common::RULE_BLOCK_CN_FET_LOOSE;
+        info!("启用规则: 屏蔽中国 IP 的全加密流量入站 (宽松模式 - 默认放过)");
     }
     if opt.block_cn_wg {
         config_flags |= rfw_common::RULE_BLOCK_CN_WIREGUARD;
@@ -187,7 +197,8 @@ async fn main() -> anyhow::Result<()> {
     // 如果需要 GeoIP 规则，从网络下载中国 IP 段数据
     if opt.block_cn_http
         || opt.block_cn_socks5
-        || opt.block_cn_fet
+        || opt.block_cn_fet_strict
+        || opt.block_cn_fet_loose
         || opt.block_cn_wg
         || opt.block_cn_all
     {
@@ -199,8 +210,7 @@ async fn main() -> anyhow::Result<()> {
             .context("下载 GeoIP 数据失败，请检查网络连接")?;
 
         // 使用 LpmTrie 进行高效的 IP 前缀匹配
-        let mut geoip_map: LpmTrie<_, u32, u8> =
-            ebpf.map_mut("GEOIP_CN").unwrap().try_into()?;
+        let mut geoip_map: LpmTrie<_, u32, u8> = ebpf.map_mut("GEOIP_CN").unwrap().try_into()?;
 
         // 将所有 CIDR 前缀加载到 LpmTrie（支持最多 65536 个条目）
         let max_entries = 65536.min(geo_data.rules.len());
@@ -218,7 +228,10 @@ async fn main() -> anyhow::Result<()> {
                     // 插入到 LpmTrie，value=1 表示中国IP
                     if let Err(e) = geoip_map.insert(&key, 1, 0) {
                         if insert_errors < 5 {
-                            warn!("插入 IP 前缀 {} (0x{:08x}/{}) 失败: {}", cidr, ip, prefix_len, e);
+                            warn!(
+                                "插入 IP 前缀 {} (0x{:08x}/{}) 失败: {}",
+                                cidr, ip, prefix_len, e
+                            );
                         }
                         insert_errors += 1;
                     } else {
@@ -229,7 +242,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if insert_errors > 0 {
-            warn!("共有 {} 个IP前缀插入失败（可能是重复或map已满）", insert_errors);
+            warn!(
+                "共有 {} 个IP前缀插入失败（可能是重复或map已满）",
+                insert_errors
+            );
         }
 
         if geo_data.rules.len() > max_entries {

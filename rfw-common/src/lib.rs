@@ -11,9 +11,10 @@ pub struct FirewallConfig {
 pub const RULE_BLOCK_EMAIL: u32 = 1 << 0; // 屏蔽发送 email
 pub const RULE_BLOCK_CN_HTTP: u32 = 1 << 1; // 屏蔽中国 IP 的 HTTP 入站
 pub const RULE_BLOCK_CN_SOCKS5: u32 = 1 << 2; // 屏蔽中国 IP 的 SOCKS5 入站
-pub const RULE_BLOCK_CN_FET: u32 = 1 << 3; // 屏蔽中国 IP 的全加密流量入站
+pub const RULE_BLOCK_CN_FET_STRICT: u32 = 1 << 3; // 屏蔽中国 IP 的全加密流量入站 (严格模式，默认阻止)
 pub const RULE_BLOCK_CN_WIREGUARD: u32 = 1 << 4; // 屏蔽中国 IP 的 WireGuard 入站
 pub const RULE_BLOCK_CN_ALL: u32 = 1 << 5; // 屏蔽中国 IP 的所有入站流量
+pub const RULE_BLOCK_CN_FET_LOOSE: u32 = 1 << 6; // 屏蔽中国 IP 的全加密流量入站 (宽松模式，默认放过)
 
 impl FirewallConfig {
     pub fn new() -> Self {
