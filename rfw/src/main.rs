@@ -81,46 +81,123 @@ fn parse_cidr_to_lpm(cidr: &str) -> Option<(u32, u32)> {
 }
 
 #[derive(Debug, Parser)]
+#[clap(
+    name = "rfw",
+    version,
+    about = "基于 eBPF/XDP 的高性能防火墙 - 使用 GeoIP 和协议深度检测",
+    long_about = "rfw (Rust Firewall) 是一个基于 eBPF/XDP 的高性能网络防火墙。\n\
+                  支持 GeoIP 过滤、协议深度检测（HTTP/SOCKS5/全加密流量/WireGuard）。\n\
+                  所有规则可组合使用，多个规则同时生效。\n\n\
+                  使用示例:\n  \
+                    # 基本用法\n  \
+                    rfw -i eth0\n\n  \
+                    # 屏蔽邮件发送和中国 HTTP 流量\n  \
+                    rfw -i eth0 --block-email --block-cn-http\n\n  \
+                    # 严格模式屏蔽中国加密流量\n  \
+                    rfw -i wlan0 --block-cn-fet-strict --block-cn-socks5\n\n  \
+                    # 全面防护\n  \
+                    rfw -i ens33 --block-cn-all --block-email\n\n  \
+                    # 测试模式（宽松规则）\n  \
+                    rfw -i eth0 --block-cn-fet-loose --block-cn-http"
+)]
 struct Opt {
+    /// 网络接口名称（如 eth0, ens33, wlan0）
+    ///
+    /// 使用 'ip link' 或 'ifconfig' 查看可用接口
     #[clap(short, long, default_value = "eth0")]
     iface: String,
 
-    /// 屏蔽发送 email (仅阻止 SMTP: 25/587/465/2525，允许接收 POP3/IMAP)
+    /// 屏蔽发送邮件流量
+    ///
+    /// 仅阻止 SMTP 发送端口: 25, 587 (STARTTLS), 465 (SMTPS), 2525
+    /// 允许接收邮件: POP3 (110, 995), IMAP (143, 993)
+    ///
+    /// 用途: 防止服务器被滥用发送垃圾邮件
     #[clap(long)]
     block_email: bool,
 
-    /// 屏蔽来自中国的 HTTP 入站流量 (端口: 80, 443)
+    /// 屏蔽来自中国 IP 的 HTTP/HTTPS 入站连接
+    ///
+    /// 使用协议深度检测识别 HTTP 请求（GET/POST/HEAD/PUT 等）
+    /// 自动从网络下载最新中国 IP 段数据
+    ///
+    /// 注意: 仅检测入站流量，不影响出站访问
     #[clap(long)]
     block_cn_http: bool,
 
-    /// 屏蔽来自中国的 SOCKS5 入站流量 (端口: 1080)
+    /// 屏蔽来自中国 IP 的 SOCKS5 代理入站连接
+    ///
+    /// 检测 SOCKS5 握手协议特征
+    /// 防止代理服务器被滥用
     #[clap(long)]
     block_cn_socks5: bool,
 
-    /// 屏蔽来自中国的全加密流量 (Fully Encrypted Traffic) 入站 - 严格模式
-    /// 严格模式：不满足豁免条件的流量默认阻止
-    #[clap(long)]
+    /// 屏蔽来自中国 IP 的全加密流量 (FET) - 严格模式
+    ///
+    /// 基于 GFW 研究论文的检测算法:
+    /// - 熵值检测 (popcount 3.4-4.6)
+    /// - 可打印字符检测
+    /// - TLS/HTTP 协议豁免
+    ///
+    /// 严格模式: 不满足豁免条件的流量默认【阻止】
+    /// 适用于: 高安全要求场景，可能误判少量合法流量
+    ///
+    /// 参考: https://gfw.report/publications/usenixsecurity23/
+    #[clap(long, conflicts_with = "block_cn_fet_loose")]
     block_cn_fet_strict: bool,
 
-    /// 屏蔽来自中国的全加密流量 (Fully Encrypted Traffic) 入站 - 宽松模式
-    /// 宽松模式：不满足豁免条件的流量默认放过（降低误判）
-    #[clap(long)]
+    /// 屏蔽来自中国 IP 的全加密流量 (FET) - 宽松模式
+    ///
+    /// 使用与严格模式相同的检测算法，但:
+    /// 宽松模式: 不满足豁免条件的流量默认【放过】
+    /// 适用于: 平衡安全与可用性，降低误判率
+    ///
+    /// 建议: 先使用宽松模式测试，观察日志后决定是否切换严格模式
+    #[clap(long, conflicts_with = "block_cn_fet_strict")]
     block_cn_fet_loose: bool,
 
-    /// 屏蔽来自中国的 WireGuard VPN 入站
+    /// 屏蔽来自中国 IP 的 WireGuard VPN 入站连接
+    ///
+    /// 检测 WireGuard 协议特征:
+    /// - 握手消息 (type 1/2/3)
+    /// - 数据包特征 (type 4)
+    ///
+    /// 用途: 防止 VPN 服务器被滥用
     #[clap(long)]
     block_cn_wg: bool,
 
-    /// 屏蔽来自中国的所有入站流量（不限协议）
+    /// 屏蔽来自中国 IP 的所有入站流量（不限协议）
+    ///
+    /// 最激进的规则，直接在 IP 层阻止所有中国来源的入站连接
+    /// 性能最优，但会阻止所有合法流量
+    ///
+    /// 警告: 启用此规则会使所有其他协议检测规则失效
     #[clap(long)]
     block_cn_all: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 首先解析命令行参数，但不立即执行程序逻辑
     let opt = Opt::parse();
 
+    // 检查是否是帮助或版本请求
+    // 如果是，clap 会自动处理并退出，不会执行到这里
+
+    // 只有真正运行程序时才初始化日志和 eBPF
     env_logger::init();
+
+    // 检查是否至少启用了一个规则
+    if !opt.block_email
+        && !opt.block_cn_http
+        && !opt.block_cn_socks5
+        && !opt.block_cn_fet_strict
+        && !opt.block_cn_fet_loose
+        && !opt.block_cn_wg
+        && !opt.block_cn_all {
+        println!("警告: 未启用任何防火墙规则，程序将运行但不执行任何过滤操作");
+        println!("使用 'rfw --help' 查看可用规则列表");
+    }
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/

@@ -547,19 +547,16 @@ fn is_fully_encrypted_traffic(
 ) -> Result<bool, ()> {
     // 至少需要16字节
     if payload_len < 16 {
-        debug!(&ctx, "不足16字节");
         return Ok(strict_mode);
     }
 
     // Ex5: TLS 豁免检测
     if is_tls(ctx, payload_offset)? {
-        debug!(&ctx, "tls");
         return Ok(false);
     }
 
     // Ex5: HTTP 豁免检测
     if is_http_request(ctx, payload_offset)? {
-        debug!(&ctx, "http");
         return Ok(false);
     }
 
@@ -584,7 +581,6 @@ fn is_fully_encrypted_traffic(
         && bytes[5] <= 0x7e;
 
     if all_printable {
-        debug!(&ctx, "文本");
         return Ok(false); // 豁免：可能是文本协议
     }
 
@@ -611,7 +607,6 @@ fn is_fully_encrypted_traffic(
 
     // 熵值异常豁免：不在 3.4-4.6 范围内（340-460）
     if avg_popcount_x100 <= 340 || avg_popcount_x100 >= 460 {
-        debug!(&ctx, "熵值异常");
         return Ok(false); // 豁免：熵值异常
     }
 
