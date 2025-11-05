@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "rfw-ebpf"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",

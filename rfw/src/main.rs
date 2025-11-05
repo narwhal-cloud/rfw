@@ -194,7 +194,8 @@ async fn main() -> anyhow::Result<()> {
         && !opt.block_cn_fet_strict
         && !opt.block_cn_fet_loose
         && !opt.block_cn_wg
-        && !opt.block_cn_all {
+        && !opt.block_cn_all
+    {
         println!("警告: 未启用任何防火墙规则，程序将运行但不执行任何过滤操作");
         println!("使用 'rfw --help' 查看可用规则列表");
     }

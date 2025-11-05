@@ -215,14 +215,14 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
 
             unsafe {
                 if needs_protocol_detection {
-                    // 优化：先检查是否是中国IP，非中国IP直接跳过协议检测
+                    let src_port = u16::from_be((*tcp_hdr).source);
+                    // 优化：先检查是否是中国IP，非中国IP直接跳过协议检测 放行443
                     // LpmTrie 查找很快（O(1)），而协议检测较慢
-                    if !is_cn_ip(src_ip)? {
+                    if !is_cn_ip(src_ip)? || src_port == 443 {
                         // 不是中国IP，直接放行，不需要协议检测
                         return Ok(xdp_action::XDP_PASS);
                     }
                     // 确认是中国IP，继续进行协议检测
-                    let src_port = u16::from_be((*tcp_hdr).source);
                     let dst_ip = (*ip_hdr).daddr;
 
                     // 提取TCP flags（_bitfield的低8位）
@@ -230,7 +230,6 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
 
                     // 跳过TCP握手包（SYN或SYN-ACK）
                     if (tcp_flags & TCP_SYN) != 0 {
-                        debug!(&ctx, "跳过协议检测: TCP握手包 (含SYN)");
                         return Ok(xdp_action::XDP_PASS);
                     }
 
@@ -414,27 +413,15 @@ fn is_http_request(ctx: &XdpContext, payload_offset: usize) -> Result<bool, ()> 
     let method_bytes = match ptr_at::<[u8; 4]>(ctx, payload_offset) {
         Ok(ptr) => unsafe { *ptr },
         Err(_) => {
-            debug!(&ctx, "HTTP检测: payload太小");
             return Ok(false);
         }
     };
-
-    debug!(
-        &ctx,
-        "HTTP检测: 读取字节 [{:x} {:x} {:x} {:x}]",
-        method_bytes[0],
-        method_bytes[1],
-        method_bytes[2],
-        method_bytes[3]
-    );
 
     // 构造u32进行比较（大端）
     let method_u32 = ((method_bytes[0] as u32) << 24)
         | ((method_bytes[1] as u32) << 16)
         | ((method_bytes[2] as u32) << 8)
         | (method_bytes[3] as u32);
-
-    debug!(&ctx, "HTTP检测: method_u32 = {:x}", method_u32);
 
     // 检查是否匹配常见的 HTTP 方法
     if method_u32 == HTTP_GET
