@@ -14,11 +14,11 @@ use core::mem::size_of;
 #[map]
 static CONFIG: Array<u32> = Array::with_max_entries(1, 0);
 
-// GeoIP 数据 map - 中国 IP 段（使用 LpmTrie 进行高效前缀匹配）
+// GeoIP 数据 map - 国家 IP 段（使用 LpmTrie 进行高效前缀匹配）
 // LpmTrie key: prefix_len (4 bytes) + IP address (4 bytes)
-// value: u8 (1 = 中国IP)
+// value: u8 (1 = 匹配的IP)
 #[map]
-static GEOIP_CN: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
+static GEOIP_MAP: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
 
 // TCP 连接跟踪 map - 记录已检测过的连接（五元组）
 // 使用 LRU 策略自动淘汰旧连接
@@ -109,13 +109,15 @@ const IPPROTO_UDP: u8 = 17;
 
 // 规则标志位
 const RULE_BLOCK_EMAIL: u32 = 1 << 0;
-const RULE_BLOCK_CN_HTTP: u32 = 1 << 1;
-const RULE_BLOCK_CN_SOCKS5: u32 = 1 << 2;
-const RULE_BLOCK_CN_FET_STRICT: u32 = 1 << 3; // FET 严格模式（默认阻止）
-const RULE_BLOCK_CN_WIREGUARD: u32 = 1 << 4;
-const RULE_BLOCK_CN_ALL: u32 = 1 << 5;
-const RULE_BLOCK_CN_FET_LOOSE: u32 = 1 << 6; // FET 宽松模式（默认放过）
-const RULE_BLOCK_CN_QUIC: u32 = 1 << 7;
+const RULE_BLOCK_HTTP: u32 = 1 << 1;
+const RULE_BLOCK_SOCKS5: u32 = 1 << 2;
+const RULE_BLOCK_FET_STRICT: u32 = 1 << 3; // FET 严格模式（默认阻止）
+const RULE_BLOCK_WIREGUARD: u32 = 1 << 4;
+const RULE_BLOCK_ALL: u32 = 1 << 5;
+const RULE_BLOCK_FET_LOOSE: u32 = 1 << 6; // FET 宽松模式（默认放过）
+const RULE_BLOCK_QUIC: u32 = 1 << 7;
+const RULE_GEOIP_ENABLED: u32 = 1 << 8; // 启用 GeoIP 国家过滤
+const RULE_GEOIP_WHITELIST: u32 = 1 << 9; // GeoIP 白名单模式
 
 // WireGuard 协议常量
 const WG_TYPE_HANDSHAKE_INIT: u8 = 1;
@@ -161,12 +163,33 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // 检查是否启用了屏蔽中国所有入站流量规则
-    if (*config_flags & RULE_BLOCK_CN_ALL) != 0 {
-        if is_cn_ip(src_ip)? {
+    // 检查是否启用了 GeoIP 过滤 + 屏蔽所有流量规则
+    if (*config_flags & RULE_BLOCK_ALL) != 0 {
+        if (*config_flags & RULE_GEOIP_ENABLED) != 0 {
+            let in_geoip_list = is_geoip_match(src_ip)?;
+            let whitelist_mode = (*config_flags & RULE_GEOIP_WHITELIST) != 0;
+
+            let should_block = if whitelist_mode {
+                // 白名单模式: 不在列表中的阻止
+                !in_geoip_list
+            } else {
+                // 黑名单模式: 在列表中的阻止
+                in_geoip_list
+            };
+
+            if should_block {
+                info!(
+                    &ctx,
+                    "BLOCKED: 所有入站流量来自受限 IP: {:i}",
+                    u32::from_be(src_ip)
+                );
+                return Ok(xdp_action::XDP_DROP);
+            }
+        } else {
+            // 未启用 GeoIP,阻止所有流量
             info!(
                 &ctx,
-                "BLOCKED: 所有入站流量来自中国 IP: {:i}",
+                "BLOCKED: 所有入站流量被阻止 (全局规则): {:i}",
                 u32::from_be(src_ip)
             );
             return Ok(xdp_action::XDP_DROP);
@@ -207,20 +230,34 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
             // 协议深度检测（HTTP/SOCKS5/FET）- 使用连接跟踪避免误判
             // 检查是否启用了任何需要协议检测的规则
             let needs_protocol_detection = (*config_flags
-                & (RULE_BLOCK_CN_HTTP
-                    | RULE_BLOCK_CN_SOCKS5
-                    | RULE_BLOCK_CN_FET_STRICT
-                    | RULE_BLOCK_CN_FET_LOOSE))
+                & (RULE_BLOCK_HTTP
+                    | RULE_BLOCK_SOCKS5
+                    | RULE_BLOCK_FET_STRICT
+                    | RULE_BLOCK_FET_LOOSE))
                 != 0;
 
             unsafe {
                 if needs_protocol_detection {
-                    // 优化：先检查是否是中国IP，非中国IP直接跳过协议检测 放行443
-                    // LpmTrie 查找很快（O(1)），而协议检测较慢
-                    if !is_cn_ip(src_ip)? {
-                        // 不是中国IP，直接放行，不需要协议检测
-                        return Ok(xdp_action::XDP_PASS);
+                    // 优化：如果启用了 GeoIP 过滤，先检查 IP 是否匹配
+                    if (*config_flags & RULE_GEOIP_ENABLED) != 0 {
+                        let in_geoip_list = is_geoip_match(src_ip)?;
+                        let whitelist_mode = (*config_flags & RULE_GEOIP_WHITELIST) != 0;
+
+                        let should_check = if whitelist_mode {
+                            // 白名单模式: 不在列表中的需要检测
+                            !in_geoip_list
+                        } else {
+                            // 黑名单模式: 在列表中的需要检测
+                            in_geoip_list
+                        };
+
+                        if !should_check {
+                            // 不需要检测此IP,直接放行
+                            return Ok(xdp_action::XDP_PASS);
+                        }
                     }
+
+                    // 443端口豁免
                     if src_port == 443 {
                         debug!(
                             &ctx,
@@ -230,7 +267,7 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                         );
                         return Ok(xdp_action::XDP_PASS);
                     }
-                    // 确认是中国IP，继续进行协议检测
+                    // 继续进行协议检测
                     let dst_ip = (*ip_hdr).daddr;
 
                     // 提取TCP flags（_bitfield的低8位）
@@ -285,11 +322,11 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                             let mut should_block = false;
 
                             // 检查 HTTP 入站屏蔽规则
-                            if (*config_flags & RULE_BLOCK_CN_HTTP) != 0 && payload_size >= 4 {
+                            if (*config_flags & RULE_BLOCK_HTTP) != 0 && payload_size >= 4 {
                                 if is_http_request(&ctx, payload_offset)? {
                                     info!(
                                         &ctx,
-                                        "BLOCKED: HTTP 入站流量来自中国, 源 {:i}:{} -> 目标端口 {}",
+                                        "BLOCKED: HTTP 入站流量, 源 {:i}:{} -> 目标端口 {}",
                                         u32::from_be(src_ip),
                                         src_port,
                                         dst_port
@@ -300,13 +337,13 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
 
                             // 检查 SOCKS5 入站屏蔽规则
                             if !should_block
-                                && (*config_flags & RULE_BLOCK_CN_SOCKS5) != 0
+                                && (*config_flags & RULE_BLOCK_SOCKS5) != 0
                                 && payload_size >= 2
                             {
                                 if is_socks5_request(&ctx, payload_offset)? {
                                     info!(
                                         &ctx,
-                                        "BLOCKED: SOCKS5 入站流量来自中国, 源 {:i}:{} -> 目标端口 {}",
+                                        "BLOCKED: SOCKS5 入站流量, 源 {:i}:{} -> 目标端口 {}",
                                         u32::from_be(src_ip),
                                         src_port,
                                         dst_port
@@ -319,8 +356,8 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                             // FET 检测需要至少 16 字节
                             if !should_block && payload_size >= 16 {
                                 // 判断模式：严格或宽松
-                                let strict_mode = (*config_flags & RULE_BLOCK_CN_FET_STRICT) != 0;
-                                let loose_mode = (*config_flags & RULE_BLOCK_CN_FET_LOOSE) != 0;
+                                let strict_mode = (*config_flags & RULE_BLOCK_FET_STRICT) != 0;
+                                let loose_mode = (*config_flags & RULE_BLOCK_FET_LOOSE) != 0;
 
                                 if strict_mode || loose_mode {
                                     if is_fully_encrypted_traffic(
@@ -336,7 +373,7 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                                             if strict_mode { "严格" } else { "宽松" };
                                         info!(
                                             &ctx,
-                                            "BLOCKED: 全加密流量 (FET-{}) 入站来自中国, 源 {:i}:{} -> 目标端口 {}",
+                                            "BLOCKED: 全加密流量 (FET-{}) 入站, 源 {:i}:{} -> 目标端口 {}",
                                             mode_str,
                                             u32::from_be(src_ip),
                                             src_port,
@@ -371,15 +408,27 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
             // UDP payload 的起始位置
             let payload_offset = size_of::<EthHdr>() + ip_hdr_len + size_of::<UdpHdr>();
 
-            // 检查 WireGuard 入站屏蔽规则（来自中国的入站）
-            if (*config_flags & RULE_BLOCK_CN_WIREGUARD) != 0 {
-                // 通过协议深度检测识别 WireGuard 流量
-                if is_cn_ip(src_ip)? && is_wireguard_packet(&ctx, payload_offset)? {
+            // 检查 WireGuard 入站屏蔽规则
+            if (*config_flags & RULE_BLOCK_WIREGUARD) != 0 {
+                // 先检查 GeoIP 过滤（如果启用）
+                let should_check_wg = if (*config_flags & RULE_GEOIP_ENABLED) != 0 {
+                    let in_geoip_list = is_geoip_match(src_ip)?;
+                    let whitelist_mode = (*config_flags & RULE_GEOIP_WHITELIST) != 0;
+                    if whitelist_mode {
+                        !in_geoip_list
+                    } else {
+                        in_geoip_list
+                    }
+                } else {
+                    true // 未启用 GeoIP,检测所有流量
+                };
+
+                if should_check_wg && is_wireguard_packet(&ctx, payload_offset)? {
                     let src_port = u16::from_be(unsafe { (*udp_hdr).source });
                     let dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
                     info!(
                         &ctx,
-                        "BLOCKED: WireGuard VPN 入站流量来自中国, 源 {:i}:{} -> 目标端口 {}",
+                        "BLOCKED: WireGuard VPN 入站流量, 源 {:i}:{} -> 目标端口 {}",
                         u32::from_be(src_ip),
                         src_port,
                         dst_port
@@ -388,15 +437,27 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                 }
             }
 
-            // 检查 QUIC 入站屏蔽规则（来自中国的入站）
-            if (*config_flags & RULE_BLOCK_CN_QUIC) != 0 {
-                // 通过协议深度检测识别 QUIC 流量
-                if is_cn_ip(src_ip)? && is_quic_packet(&ctx, payload_offset)? {
+            // 检查 QUIC 入站屏蔽规则
+            if (*config_flags & RULE_BLOCK_QUIC) != 0 {
+                // 先检查 GeoIP 过滤（如果启用）
+                let should_check_quic = if (*config_flags & RULE_GEOIP_ENABLED) != 0 {
+                    let in_geoip_list = is_geoip_match(src_ip)?;
+                    let whitelist_mode = (*config_flags & RULE_GEOIP_WHITELIST) != 0;
+                    if whitelist_mode {
+                        !in_geoip_list
+                    } else {
+                        in_geoip_list
+                    }
+                } else {
+                    true // 未启用 GeoIP,检测所有流量
+                };
+
+                if should_check_quic && is_quic_packet(&ctx, payload_offset)? {
                     let src_port = u16::from_be(unsafe { (*udp_hdr).source });
                     let dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
                     info!(
                         &ctx,
-                        "BLOCKED: QUIC 入站流量来自中国, 源 {:i}:{} -> 目标端口 {}",
+                        "BLOCKED: QUIC 入站流量, 源 {:i}:{} -> 目标端口 {}",
                         u32::from_be(src_ip),
                         src_port,
                         dst_port
@@ -493,17 +554,17 @@ fn is_socks5_request(ctx: &XdpContext, payload_offset: usize) -> Result<bool, ()
     }
 }
 
-// 检查 IP 是否属于中国
+// 检查 IP 是否匹配 GeoIP 列表
 // 使用 LpmTrie 进行高效的最长前缀匹配，时间复杂度 O(1)
 #[inline(always)]
-fn is_cn_ip(ip: u32) -> Result<bool, ()> {
+fn is_geoip_match(ip: u32) -> Result<bool, ()> {
     // 构造 LpmTrie Key: prefix_len=32 (查询完整IP地址)
     let key = Key::<u32>::new(32, ip);
 
     // 进行最长前缀匹配查询
-    match GEOIP_CN.get(&key) {
-        Some(&1) => Ok(true), // 找到匹配的中国IP前缀
-        _ => Ok(false),       // 未找到或不是中国IP
+    match GEOIP_MAP.get(&key) {
+        Some(&1) => Ok(true), // 找到匹配的 IP 前缀
+        _ => Ok(false),       // 未找到
     }
 }
 

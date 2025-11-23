@@ -1,6 +1,6 @@
 # rfw
 
-Rust Firewall - 基于 eBPF/XDP 的高性能防火墙，支持协议深度检测
+Rust Firewall - 基于 eBPF/XDP 的高性能防火墙，支持 GeoIP 过滤和协议深度检测
 
 [![Release](https://github.com/narwhal-cloud/rfw/actions/workflows/build.yml/badge.svg)](https://github.com/narwhal-cloud/rfw/actions/workflows/build.yml)
 
@@ -15,15 +15,24 @@ Rust Firewall - 基于 eBPF/XDP 的高性能防火墙，支持协议深度检测
 
 ## 功能特性
 
-### 支持的规则
+### 灵活的 GeoIP 过滤
+
+- **多国家支持** - 支持指定任意国家代码（CN、RU、KP、US 等）
+- **灵活的过滤模式**:
+  - **黑名单模式** - 阻止指定国家的流量
+  - **白名单模式** - 只允许指定国家的流量
+  - **无 GeoIP 模式** - 直接基于协议规则过滤所有流量
+- **自动下载 GeoIP 数据** - 运行时自动下载指定国家的最新 IP 段
+
+### 支持的过滤规则
 
 1. **屏蔽 Email** - 阻止邮件（SMTP: 25/587/465/2525）相关端口流量
-2. **屏蔽中国 IP 的 HTTP 入站** - 使用协议深度检测识别 HTTP 流量，阻止来自中国 IP 的 HTTP 入站连接
-3. **屏蔽中国 IP 的 SOCKS5 入站** - 使用协议深度检测识别 SOCKS5 流量，阻止来自中国 IP 的 SOCKS5 入站连接
-4. **屏蔽中国 IP 的全加密流量入站** - 使用 FET 算法识别 Shadowsocks、V2Ray 等加密代理，阻止来自中国 IP 的全加密代理流量
-5. **屏蔽中国 IP 的 WireGuard VPN 入站** - 精准识别 WireGuard VPN 协议，阻止来自中国 IP 的 WireGuard 流量
-6. **屏蔽中国 IP 的 QUIC 入站** - 精准识别 QUIC 协议（HTTP/3），阻止来自中国 IP 的 QUIC 流量
-7. **屏蔽中国 IP 的所有入站流量** - 阻止所有来自中国 IP 的入站连接（不限协议、不限端口）
+2. **屏蔽 HTTP 入站** - 使用协议深度检测识别 HTTP 流量，配合 GeoIP 或全局过滤
+3. **屏蔽 SOCKS5 入站** - 使用协议深度检测识别 SOCKS5 流量，配合 GeoIP 或全局过滤
+4. **屏蔽全加密流量入站** - 使用 FET 算法识别 Shadowsocks、V2Ray 等加密代理
+5. **屏蔽 WireGuard VPN 入站** - 精准识别 WireGuard VPN 协议
+6. **屏蔽 QUIC 入站** - 精准识别 QUIC 协议（HTTP/3）
+7. **屏蔽所有入站流量** - 阻止所有入站连接（配合 GeoIP 或全局）
 
 ### 协议深度检测 (DPI)
 
@@ -45,7 +54,8 @@ Rust Firewall - 基于 eBPF/XDP 的高性能防火墙，支持协议深度检测
 ### 协议支持
 
 - **仅支持 IPv4**：目前不支持 IPv6 流量
-- **GeoIP 自动更新**：每次运行时自动下载最新的中国 IP 数据
+- **GeoIP 自动更新**：每次运行时自动下载指定国家的最新 IP 数据
+- **多数据源**：使用 [lyc8503/sing-box-rules](https://github.com/lyc8503/sing-box-rules) 提供的 GeoIP 数据
 
 ## 快速开始
 
@@ -72,22 +82,72 @@ CC=aarch64-linux-musl-gcc cargo build --package rfw --release \
 # 查看帮助
 sudo ./target/release/rfw --help
 
-# 启用所有规则
+# 阻止指定国家的 HTTP 和 SOCKS5 流量
 sudo ./target/release/rfw --iface eth0 \
-  --block-email \
-  --block-cn-http \
-  --block-cn-socks5 \
-  --block-cn-fet-strict \
-  --block-cn-wg \
-  --block-cn-quic
+  --countries CN,RU,KP \
+  --block-http --block-socks5
+
+# 阻止来自中国的所有流量（快捷方式）
+sudo ./target/release/rfw --iface eth0 \
+  --block-all-from CN
+
+# 白名单模式：只允许来自美国、日本、韩国的流量
+sudo ./target/release/rfw --iface eth0 \
+  --allow-only-countries US,JP,KR \
+  --block-http --block-socks5
+
+# 不限国家，阻止所有 HTTP 流量
+sudo ./target/release/rfw --iface eth0 \
+  --block-http
 
 # 启用详细日志
-sudo RUST_LOG=info ./target/release/rfw --iface eth0 --block-cn-wg --block-cn-quic
+sudo RUST_LOG=info ./target/release/rfw --iface eth0 --countries CN --block-wireguard --block-quic
 ```
 
 ## 使用说明
 
-### 规则详解
+### GeoIP 配置
+
+#### 1. 黑名单模式（阻止指定国家）
+
+```bash
+# 阻止来自中国、俄罗斯、朝鲜的 HTTP 流量
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN,RU,KP \
+  --block-http
+
+# 阻止来自指定国家的所有流量
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN,RU \
+  --block-all
+```
+
+#### 2. 白名单模式（只允许指定国家）
+
+```bash
+# 只允许来自美国、日本、韩国的访问
+sudo ./target/release/rfw --iface eth0 \
+  --allow-only-countries US,JP,KR \
+  --block-http --block-socks5
+```
+
+#### 3. 快捷方式：阻止指定国家的所有流量
+
+```bash
+# 等价于 --countries CN --block-all
+sudo ./target/release/rfw --iface eth0 \
+  --block-all-from CN,RU,KP
+```
+
+#### 4. 不使用 GeoIP（全局协议过滤）
+
+```bash
+# 阻止所有来源的 HTTP 和 SOCKS5 流量
+sudo ./target/release/rfw --iface eth0 \
+  --block-http --block-socks5
+```
+
+### 协议规则详解
 
 #### 1. 屏蔽发送 Email
 
@@ -120,29 +180,51 @@ sudo ./target/release/rfw --iface eth0 --block-email
 - 防止恶意软件发送钓鱼邮件
 - 允许用户正常接收邮件，但禁止发送
 
-#### 2. 屏蔽中国 IP 的 HTTP 入站
+#### 2. 屏蔽 HTTP 入站
 
 ```bash
-sudo ./target/release/rfw --iface eth0 --block-cn-http
+# 阻止指定国家的 HTTP 流量
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN,RU \
+  --block-http
+
+# 阻止所有来源的 HTTP 流量
+sudo ./target/release/rfw --iface eth0 \
+  --block-http
 ```
 
-阻止来自中国 IP 的 HTTP 入站连接（仅明文 HTTP，不包括 HTTPS）
+阻止 HTTP 入站连接（仅明文 HTTP，不包括 HTTPS）
 
-#### 3. 屏蔽中国 IP 的 SOCKS5 入站
+#### 3. 屏蔽 SOCKS5 入站
 
 ```bash
-sudo ./target/release/rfw --iface eth0 --block-cn-socks5
+# 阻止指定国家的 SOCKS5 流量
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN \
+  --block-socks5
+
+# 阻止所有来源的 SOCKS5 流量
+sudo ./target/release/rfw --iface eth0 \
+  --block-socks5
 ```
 
-阻止来自中国 IP 的 SOCKS5 代理入站连接
+阻止 SOCKS5 代理入站连接
 
-#### 4. 屏蔽中国 IP 的全加密流量入站
+#### 4. 屏蔽全加密流量入站
 
 ```bash
-sudo ./target/release/rfw --iface eth0 --block-cn-fet-strict
+# 严格模式：阻止指定国家的全加密流量
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN \
+  --block-fet-strict
+
+# 宽松模式
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN \
+  --block-fet-loose
 ```
 
-阻止来自中国 IP 的全加密代理流量（Shadowsocks、V2Ray 等）
+阻止全加密代理流量（Shadowsocks、V2Ray 等）
 
 **特点：**
 - 使用统计算法识别加密代理特征
@@ -152,26 +234,40 @@ sudo ./target/release/rfw --iface eth0 --block-cn-fet-strict
 **注意：**
 - 检测基于统计特征，可能有极少的误报
 
-#### 5. 屏蔽中国 IP 的 WireGuard VPN 入站
+#### 5. 屏蔽 WireGuard VPN 入站
 
 ```bash
-sudo ./target/release/rfw --iface eth0 --block-cn-wg
+# 阻止指定国家的 WireGuard 流量
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN \
+  --block-wireguard
+
+# 阻止所有来源的 WireGuard 流量
+sudo ./target/release/rfw --iface eth0 \
+  --block-wireguard
 ```
 
-阻止来自中国 IP 的 WireGuard VPN 流量
+阻止 WireGuard VPN 流量
 
 **特点：**
 - 基于 WireGuard 协议特征精准识别
 - 误报率极低，性能开销小
 - 不会影响其他 UDP 应用
 
-#### 6. 屏蔽中国 IP 的 QUIC 入站
+#### 6. 屏蔽 QUIC 入站
 
 ```bash
-sudo ./target/release/rfw --iface eth0 --block-cn-quic
+# 阻止指定国家的 QUIC 流量
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN \
+  --block-quic
+
+# 阻止所有来源的 QUIC 流量
+sudo ./target/release/rfw --iface eth0 \
+  --block-quic
 ```
 
-阻止来自中国 IP 的 QUIC 协议流量（HTTP/3）
+阻止 QUIC 协议流量（HTTP/3）
 
 **特点：**
 - 精准识别 QUIC v1（RFC 9000）和 QUIC v2（RFC 9369）
@@ -190,72 +286,79 @@ sudo ./target/release/rfw --iface eth0 --block-cn-quic
 - 防止 QUIC 代理服务器被滥用
 - 限制新一代加密传输协议的入站连接
 
-#### 7. 屏蔽中国 IP 的所有入站流量
+#### 7. 屏蔽所有入站流量
 
 ```bash
-sudo ./target/release/rfw --iface eth0 --block-cn-all
+# 阻止指定国家的所有流量
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN,RU \
+  --block-all
+
+# 快捷方式
+sudo ./target/release/rfw --iface eth0 \
+  --block-all-from CN,RU
+
+# 白名单模式：只允许指定国家
+sudo ./target/release/rfw --iface eth0 \
+  --allow-only-countries US,JP,KR \
+  --block-all
+
+# 阻止所有来源的流量（不使用 GeoIP）
+sudo ./target/release/rfw --iface eth0 \
+  --block-all
 ```
 
-阻止**所有**来自中国 IP 的入站流量（不限协议、不限端口）
+阻止**所有**入站流量（不限协议、不限端口）
 
 **特点：**
-- 仅基于 GeoIP 检测，性能开销最小
+- 配合 GeoIP 时，仅基于 GeoIP 检测，性能开销最小
 - 最彻底的屏蔽方式
 - 优先级最高，在协议检测之前执行
 
 **使用场景：**
-- 服务器只面向非中国地区用户
-- 需要最彻底地阻止来自中国的访问
+- 服务器只面向特定地区用户（使用白名单模式）
+- 需要彻底阻止来自特定国家的访问
 
 **注意：**
-- 如果启用此规则，无需启用其他 CN 规则
+- 如果启用此规则，无需启用其他协议检测规则
 - 只影响入站流量，不影响出站流量
 
 ### 组合使用多个规则
 
 ```bash
-# 同时启用所有规则
+# 同时启用所有规则（针对指定国家）
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN,RU,KP \
+  --block-email \
+  --block-http \
+  --block-socks5 \
+  --block-fet-strict \
+  --block-wireguard \
+  --block-quic
+
+# 多国家分别配置（使用白名单）
+sudo ./target/release/rfw --iface eth0 \
+  --allow-only-countries US,JP,KR,SG \
+  --block-http \
+  --block-socks5
+
+# 不使用 GeoIP,全局协议检测
+sudo ./target/release/rfw --iface eth0 \
+  --block-http \
+  --block-socks5 \
+  --block-wireguard \
+  --block-quic
+
+# 组合使用：邮件 + 特定国家的代理协议
 sudo ./target/release/rfw --iface eth0 \
   --block-email \
-  --block-cn-http \
-  --block-cn-socks5 \
-  --block-cn-fet-strict \
-  --block-cn-wg \
-  --block-cn-quic
+  --countries CN \
+  --block-http \
+  --block-socks5
 
-# 仅启用 GeoIP 相关规则
+# 最激进模式：阻止指定国家的所有流量
 sudo ./target/release/rfw --iface eth0 \
-  --block-cn-http \
-  --block-cn-socks5 \
-  --block-cn-fet-strict \
-  --block-cn-wg \
-  --block-cn-quic
-
-# 仅启用协议检测规则（HTTP + SOCKS5）
-sudo ./target/release/rfw --iface eth0 \
-  --block-cn-http \
-  --block-cn-socks5
-
-# 仅启用全加密流量检测
-sudo ./target/release/rfw --iface eth0 \
-  --block-cn-fet-strict
-
-# 仅启用 VPN/代理协议检测（WireGuard + QUIC）
-sudo ./target/release/rfw --iface eth0 \
-  --block-cn-wg \
-  --block-cn-quic
-
-# 仅启用 WireGuard VPN 检测
-sudo ./target/release/rfw --iface eth0 \
-  --block-cn-wg
-
-# 仅启用 QUIC 协议检测
-sudo ./target/release/rfw --iface eth0 \
-  --block-cn-quic
-
-# 仅启用屏蔽所有中国 IP 入站（最简单直接）
-sudo ./target/release/rfw --iface eth0 \
-  --block-cn-all
+  --block-all-from CN,RU,KP
 ```
 
 ### 运行要求
@@ -298,10 +401,19 @@ rfw 基于 **eBPF/XDP** 技术，使用 **Rust** 语言开发。
 1. 在网卡驱动层拦截数据包（XDP）
 2. 检查是否为 IPv4 数据包（**目前仅支持 IPv4**）
 3. 根据启用的规则进行检测：
-   - GeoIP 检测：检查源 IP 是否属于中国
-   - 协议检测：识别 HTTP、SOCKS5、WireGuard、QUIC 等协议特征
-   - 端口检测：识别 Email 发送端口
+   - **GeoIP 检测**：使用 LpmTrie 高效匹配源 IP 是否在指定国家列表中
+   - **白名单/黑名单模式**：支持阻止指定国家或只允许指定国家
+   - **协议检测**：识别 HTTP、SOCKS5、WireGuard、QUIC 等协议特征
+   - **端口检测**：识别 Email 发送端口
 4. 返回判决：允许通过或丢弃
+
+### GeoIP 数据管理
+
+- **数据源**: [lyc8503/sing-box-rules](https://github.com/lyc8503/sing-box-rules)
+- **存储方式**: 使用 LpmTrie (Longest Prefix Match Trie) 进行高效前缀匹配
+- **容量**: 最多支持 65536 个 CIDR 前缀
+- **性能**: O(1) 时间复杂度的 IP 查询
+- **更新策略**: 每次程序启动时自动下载最新数据
 
 ### 性能优势
 
