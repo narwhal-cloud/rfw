@@ -33,6 +33,7 @@ Rust Firewall - 基于 eBPF/XDP 的高性能防火墙，支持 GeoIP 过滤和�
 5. **屏蔽 WireGuard VPN 入站** - 精准识别 WireGuard VPN 协议
 6. **屏蔽 QUIC 入站** - 精准识别 QUIC 协议（HTTP/3）
 7. **屏蔽所有入站流量** - 阻止所有入站连接（配合 GeoIP 或全局）
+8. **端口访问日志** - 记录所有端口被哪些 IP 访问，以及是否被阻断
 
 ### 协议深度检测 (DPI)
 
@@ -322,6 +323,105 @@ sudo ./target/release/rfw --iface eth0 \
 **注意：**
 - 如果启用此规则，无需启用其他协议检测规则
 - 只影响入站流量，不影响出站流量
+
+#### 8. 端口访问日志
+
+端口访问日志功能可以记录所有端口被哪些 IP 访问，以及这些访问是被允许还是被阻断。
+
+##### 启用日志记录
+
+在启动防火墙时添加 `--log-port-access` 参数即可启用端口访问日志：
+
+```bash
+# 启动防火墙并启用端口访问日志
+sudo ./target/release/rfw --iface eth0 \
+  --block-http --block-socks5 \
+  --log-port-access
+
+# 配合 GeoIP 使用
+sudo ./target/release/rfw --iface eth0 \
+  --countries CN,RU \
+  --block-http --block-wireguard \
+  --log-port-access
+```
+
+##### 查看统计信息
+
+在防火墙运行时，使用 `stats` 子命令查看访问统计：
+
+```bash
+# 查看所有端口访问记录
+sudo ./target/release/rfw stats
+
+# 按端口过滤
+sudo ./target/release/rfw stats --port 80
+
+# 按源 IP 过滤
+sudo ./target/release/rfw stats --ip 1.2.3.4
+
+# 只显示被阻断的访问
+sudo ./target/release/rfw stats --blocked-only
+
+# 只显示允许通过的访问
+sudo ./target/release/rfw stats --allowed-only
+
+# 按端口分组显示（汇总统计）
+sudo ./target/release/rfw stats --group-by-port
+
+# 组合使用过滤条件
+sudo ./target/release/rfw stats --port 80 --blocked-only
+```
+
+##### 输出示例
+
+**列表模式（默认）：**
+
+```
+Source IP        Proto      Port      Allowed      Blocked        Total
+------------------------------------------------------------------------
+1.2.3.4          TCP          80            0          156          156
+5.6.7.8          TCP        8080           45            0           45
+9.10.11.12       UDP         443           12            8           20
+```
+
+**分组模式（--group-by-port）：**
+
+```
+Port 80/TCP
+Source IP             Allowed      Blocked        Total
+--------------------------------------------------------
+1.2.3.4                     0          156          156
+5.6.7.8                   120            0          120
+
+Port 8080/TCP
+Source IP             Allowed      Blocked        Total
+--------------------------------------------------------
+9.10.11.12               45            0           45
+```
+
+##### 技术实现
+
+- **BPF 文件系统共享**: 使用 `/sys/fs/bpf` pinning 机制实现跨进程 eBPF map 共享
+- **LRU 缓存**: 自动淘汰旧记录，最多存储 65536 条记录
+- **实时更新**: 统计数据在内核中实时记录，无需重启防火墙
+- **低开销**: 仅当启用 `--log-port-access` 时才记录，不影响未启用时的性能
+- **高性能**: 所有统计在 eBPF 内核中完成，几乎无性能损耗
+
+##### 注意事项
+
+1. **需要 root 权限**: 访问 `/sys/fs/bpf` 需要 root 权限
+2. **防火墙必须运行**: `stats` 命令依赖正在运行的防火墙进程（需启用 `--log-port-access`）
+3. **BPF 文件系统**: 需要 `/sys/fs/bpf` 已挂载（大多数 Linux 系统默认已挂载）
+4. **容量限制**: 最多存储 65536 条不同的访问记录（源IP + 目标端口 + 协议组合）
+5. **自动清理**: 使用 LRU 策略，旧记录会被自动淘汰以腾出空间
+6. **协议支持**: 记录 TCP 和 UDP 协议的访问
+
+##### 使用场景
+
+- **安全审计**: 了解服务器上哪些端口被访问，来源 IP 是哪些
+- **攻击分析**: 查看哪些 IP 的访问被阻断，分析攻击模式
+- **服务监控**: 监控特定端口的访问频率和来源分布
+- **规则优化**: 根据访问统计优化防火墙规则
 
 ### 组合使用多个规则
 

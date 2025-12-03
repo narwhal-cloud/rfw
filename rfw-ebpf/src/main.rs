@@ -26,6 +26,12 @@ static GEOIP_MAP: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
 #[map]
 static TCP_CONN_TRACKER: LruHashMap<ConnKey, u8> = LruHashMap::with_max_entries(65536, 0);
 
+// 端口访问记录 map - 记录每个端口被哪些 IP 访问
+// Key: (dst_port, src_ip)，Value: 访问统计信息
+#[map]
+static PORT_ACCESS_LOG: LruHashMap<PortAccessKey, PortAccessStats> =
+    LruHashMap::with_max_entries(65536, 0);
+
 // 连接状态常量
 const CONN_STATE_ALLOWED: u8 = 0;
 const CONN_STATE_BLOCKED: u8 = 1;
@@ -40,6 +46,25 @@ struct ConnKey {
     dst_port: u16,
     protocol: u8,
     _padding: [u8; 3], // 对齐到8字节
+}
+
+// 端口访问记录的 key
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PortAccessKey {
+    dst_port: u16,
+    protocol: u8,
+    _padding: u8,
+    src_ip: u32,
+}
+
+// 端口访问统计信息
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PortAccessStats {
+    allowed_count: u64, // 允许通过的次数
+    blocked_count: u64, // 被阻断的次数
+    last_seen: u64,     // 最后访问时间（保留，暂时未使用）
 }
 
 // 以太网头部
@@ -118,6 +143,7 @@ const RULE_BLOCK_FET_LOOSE: u32 = 1 << 6; // FET 宽松模式（默认放过）
 const RULE_BLOCK_QUIC: u32 = 1 << 7;
 const RULE_GEOIP_ENABLED: u32 = 1 << 8; // 启用 GeoIP 国家过滤
 const RULE_GEOIP_WHITELIST: u32 = 1 << 9; // GeoIP 白名单模式
+const RULE_LOG_PORT_ACCESS: u32 = 1 << 10; // 记录端口访问日志
 
 // WireGuard 协议常量
 const WG_TYPE_HANDSHAKE_INIT: u8 = 1;
@@ -218,10 +244,16 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
             if (*config_flags & RULE_BLOCK_EMAIL) != 0 {
                 // 封禁所有 SMTP 相关端口，无论方向
                 if dst_port == 25 || dst_port == 587 || dst_port == 465 || dst_port == 2525 {
+                    if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                        log_port_access(src_ip, dst_port, IPPROTO_TCP, true);
+                    }
                     info!(&ctx, "BLOCKED: SMTP 流量被阻止, 目标端口: {}", dst_port);
                     return Ok(xdp_action::XDP_DROP);
                 }
                 if src_port == 25 || src_port == 587 || src_port == 465 || src_port == 2525 {
+                    if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                        log_port_access(src_ip, dst_port, IPPROTO_TCP, true);
+                    }
                     info!(&ctx, "BLOCKED: SMTP 流量被阻止, 源端口: {}", src_port);
                     return Ok(xdp_action::XDP_DROP);
                 }
@@ -257,16 +289,6 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                         }
                     }
 
-                    // 443端口豁免
-                    if src_port == 443 {
-                        debug!(
-                            &ctx,
-                            "443端口豁免: 源 {:i}:443 -> 目标端口 {}",
-                            u32::from_be(src_ip),
-                            dst_port
-                        );
-                        return Ok(xdp_action::XDP_PASS);
-                    }
                     // 继续进行协议检测
                     let dst_ip = (*ip_hdr).daddr;
 
@@ -303,7 +325,15 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                         Some(&state) => {
                             // 连接已被检测过
                             if state == CONN_STATE_BLOCKED {
+                                if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                                    log_port_access(src_ip, dst_port, IPPROTO_TCP, true);
+                                }
                                 return Ok(xdp_action::XDP_DROP);
+                            } else {
+                                // 连接已允许，记录日志
+                                if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                                    log_port_access(src_ip, dst_port, IPPROTO_TCP, false);
+                                }
                             }
                         }
                         None => {
@@ -391,10 +421,16 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                             if should_block {
                                 // 标记这个连接为已阻止，后续包也会被DROP
                                 let _ = TCP_CONN_TRACKER.insert(&conn_key, &CONN_STATE_BLOCKED, 0);
+                                if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                                    log_port_access(src_ip, dst_port, IPPROTO_TCP, true);
+                                }
                                 return Ok(xdp_action::XDP_DROP);
                             } else {
                                 // 标记这个连接为已通过，后续包直接放行
                                 let _ = TCP_CONN_TRACKER.insert(&conn_key, &CONN_STATE_ALLOWED, 0);
+                                if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                                    log_port_access(src_ip, dst_port, IPPROTO_TCP, false);
+                                }
                             }
                         }
                     }
@@ -426,6 +462,9 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                 if should_check_wg && is_wireguard_packet(&ctx, payload_offset)? {
                     let src_port = u16::from_be(unsafe { (*udp_hdr).source });
                     let dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
+                    if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                        log_port_access(src_ip, dst_port, IPPROTO_UDP, true);
+                    }
                     info!(
                         &ctx,
                         "BLOCKED: WireGuard VPN 入站流量, 源 {:i}:{} -> 目标端口 {}",
@@ -455,6 +494,9 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                 if should_check_quic && is_quic_packet(&ctx, payload_offset)? {
                     let src_port = u16::from_be(unsafe { (*udp_hdr).source });
                     let dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
+                    if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                        log_port_access(src_ip, dst_port, IPPROTO_UDP, true);
+                    }
                     info!(
                         &ctx,
                         "BLOCKED: QUIC 入站流量, 源 {:i}:{} -> 目标端口 {}",
@@ -1010,6 +1052,41 @@ fn is_quic_packet(ctx: &XdpContext, payload_offset: usize) -> Result<bool, ()> {
     }
 
     Ok(false)
+}
+
+// 记录端口访问
+// 参数：源IP、目标端口、协议、是否被阻断
+#[inline(always)]
+fn log_port_access(src_ip: u32, dst_port: u16, protocol: u8, blocked: bool) {
+    let key = PortAccessKey {
+        dst_port,
+        protocol,
+        _padding: 0,
+        src_ip,
+    };
+
+    // 尝试获取现有记录
+    match unsafe { PORT_ACCESS_LOG.get(&key) } {
+        Some(stats) => {
+            // 更新统计
+            let mut new_stats = *stats;
+            if blocked {
+                new_stats.blocked_count = new_stats.blocked_count.saturating_add(1);
+            } else {
+                new_stats.allowed_count = new_stats.allowed_count.saturating_add(1);
+            }
+            let _ = PORT_ACCESS_LOG.insert(&key, &new_stats, 0);
+        }
+        None => {
+            // 创建新记录
+            let new_stats = PortAccessStats {
+                allowed_count: if blocked { 0 } else { 1 },
+                blocked_count: if blocked { 1 } else { 0 },
+                last_seen: 0,
+            };
+            let _ = PORT_ACCESS_LOG.insert(&key, &new_stats, 0);
+        }
+    }
 }
 
 // 辅助函数：从数据包中获取指定偏移的指针

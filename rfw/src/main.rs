@@ -1,10 +1,13 @@
 use anyhow::Context as _;
-use aya::maps::{Array, LpmTrie};
+use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie};
 use aya::programs::{Xdp, XdpFlags};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 #[rustfmt::skip]
 use log::{debug, info, warn};
+use rfw_common::{PortAccessKey, PortAccessStats};
 use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use tokio::signal;
 
 // GeoIP 数据JSON结构
@@ -23,7 +26,11 @@ async fn fetch_geoip_data(country_code: &str) -> anyhow::Result<GeoIpData> {
     const GEOIP_URL_TEMPLATE: &str = "https://raw.githubusercontent.com/lyc8503/sing-box-rules/refs/heads/rule-set-geoip/geoip-{}.json";
 
     let url = GEOIP_URL_TEMPLATE.replace("{}", &country_code.to_lowercase());
-    info!("正在从 {} 下载 {} 的 GeoIP 数据...", url, country_code.to_uppercase());
+    info!(
+        "正在从 {} 下载 {} 的 GeoIP 数据...",
+        url,
+        country_code.to_uppercase()
+    );
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -32,20 +39,30 @@ async fn fetch_geoip_data(country_code: &str) -> anyhow::Result<GeoIpData> {
     let response = client.get(&url).send().await?;
 
     if !response.status().is_success() {
-        anyhow::bail!("下载 {} 的 GeoIP 数据失败: HTTP {}", country_code, response.status());
+        anyhow::bail!(
+            "下载 {} 的 GeoIP 数据失败: HTTP {}",
+            country_code,
+            response.status()
+        );
     }
 
     let geo_data: GeoIpData = response.json().await?;
 
     // 统计总的 CIDR 条目数
     let total_cidrs: usize = geo_data.rules.iter().map(|r| r.ip_cidr.len()).sum();
-    info!("成功下载并解析 {} 的 {} 个 IP CIDR 前缀", country_code.to_uppercase(), total_cidrs);
+    info!(
+        "成功下载并解析 {} 的 {} 个 IP CIDR 前缀",
+        country_code.to_uppercase(),
+        total_cidrs
+    );
 
     Ok(geo_data)
 }
 
 // 批量下载多个国家的 GeoIP 数据
-async fn fetch_multiple_geoip_data(country_codes: &[String]) -> anyhow::Result<Vec<(String, GeoIpData)>> {
+async fn fetch_multiple_geoip_data(
+    country_codes: &[String],
+) -> anyhow::Result<Vec<(String, GeoIpData)>> {
     let mut results = Vec::new();
 
     for code in country_codes {
@@ -110,39 +127,170 @@ fn parse_cidr_to_lpm(cidr: &str) -> Option<(u32, u32)> {
     Some((network_ip, prefix_len))
 }
 
+fn run_stats(opt: StatsOpt) -> anyhow::Result<()> {
+    //  使用 reuse_pinned_maps 加载 eBPF，以便访问已 pin 的 map
+    let mut ebpf = aya::EbpfLoader::new()
+        .map_pin_path(
+            "PORT_ACCESS_LOG",
+            std::path::Path::new("/sys/fs/bpf/rfw_port_access_log"),
+        )
+        .load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/rfw"
+        )))
+        .context("无法加载 eBPF 程序")?;
+
+    let port_access_map: AyaHashMap<_, PortAccessKey, PortAccessStats> = ebpf
+        .take_map("PORT_ACCESS_LOG")
+        .context("无法找到 PORT_ACCESS_LOG map，请确保 rfw 正在运行并启用了 --log-port-access")?
+        .try_into()?;
+
+    // 读取所有记录
+    let mut records: Vec<(PortAccessKey, PortAccessStats)> = Vec::new();
+
+    for item in port_access_map.iter() {
+        let (key, stats) = item?;
+
+        // 应用过滤
+        if let Some(port_filter) = opt.port {
+            if key.dst_port != port_filter {
+                continue;
+            }
+        }
+
+        if let Some(ref ip_filter) = opt.ip {
+            let ip: Ipv4Addr = ip_filter.parse()?;
+            if key.src_ip != u32::from(ip).to_be() {
+                continue;
+            }
+        }
+
+        if opt.blocked_only && stats.blocked_count == 0 {
+            continue;
+        }
+
+        if opt.allowed_only && stats.allowed_count == 0 {
+            continue;
+        }
+
+        records.push((key, stats));
+    }
+
+    if records.is_empty() {
+        println!("没有找到匹配的访问记录");
+        println!("提示: 请确保 rfw 使用 --log-port-access 参数运行");
+        return Ok(());
+    }
+
+    // 排序：优先显示阻断最多的
+    records.sort_by(|a, b| {
+        b.1.blocked_count
+            .cmp(&a.1.blocked_count)
+            .then_with(|| b.1.allowed_count.cmp(&a.1.allowed_count))
+    });
+
+    let total_count = records.len();
+
+    if opt.group_by_port {
+        // 按端口分组显示
+        let mut port_groups: BTreeMap<(u16, u8), Vec<(PortAccessKey, PortAccessStats)>> =
+            BTreeMap::new();
+        for (key, stats) in records {
+            port_groups
+                .entry((key.dst_port, key.protocol))
+                .or_insert_with(Vec::new)
+                .push((key, stats));
+        }
+
+        for ((port, protocol), entries) in port_groups {
+            let protocol_name = if protocol == 6 { "TCP" } else { "UDP" };
+            println!("\nPort {}/{}", port, protocol_name);
+            println!(
+                "{:<16} {:>12} {:>12} {:>12}",
+                "Source IP", "Allowed", "Blocked", "Total"
+            );
+            println!("{}", "-".repeat(56));
+
+            for (key, stats) in entries {
+                let src_ip = Ipv4Addr::from(u32::from_be(key.src_ip));
+                let total = stats.allowed_count + stats.blocked_count;
+                println!(
+                    "{:<16} {:>12} {:>12} {:>12}",
+                    src_ip.to_string(), stats.allowed_count, stats.blocked_count, total
+                );
+            }
+        }
+    } else {
+        // 列表显示
+        println!(
+            "{:<16} {:<8} {:>8} {:>12} {:>12} {:>12}",
+            "Source IP", "Proto", "Port", "Allowed", "Blocked", "Total"
+        );
+        println!("{}", "-".repeat(72));
+
+        for (key, stats) in records {
+            let src_ip = Ipv4Addr::from(u32::from_be(key.src_ip));
+            let protocol_name = if key.protocol == 6 { "TCP" } else { "UDP" };
+            let total = stats.allowed_count + stats.blocked_count;
+
+            println!(
+                "{:<16} {:<8} {:>8} {:>12} {:>12} {:>12}",
+                src_ip.to_string(),
+                protocol_name,
+                key.dst_port,
+                stats.allowed_count,
+                stats.blocked_count,
+                total
+            );
+        }
+    }
+
+    println!("\nTotal records: {}", total_count);
+
+    Ok(())
+}
+
 #[derive(Debug, Parser)]
-#[clap(
-    name = "rfw",
-    version,
-    about = "基于 eBPF/XDP 的高性能防火墙 - 使用 GeoIP 和协议深度检测",
-    long_about = "\
-rfw (Rust Firewall) 是一个基于 eBPF/XDP 的高性能网络防火墙。
-支持 GeoIP 过滤、协议深度检测（HTTP/SOCKS5/全加密流量/WireGuard）。
-所有规则可组合使用，多个规则同时生效。
+#[clap(name = "rfw", version, about = "基于 eBPF/XDP 的高性能防火墙")]
+struct Cli {
+    #[clap(subcommand)]
+    command: Option<Commands>,
 
-使用示例:
-  # 基本用法
-  rfw -i eth0
+    #[clap(flatten)]
+    run_opts: RunOpt,
+}
 
-  # 屏蔽邮件发送和指定国家 HTTP 流量
-  rfw -i eth0 --block-email --countries CN --block-http
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// 查看端口访问统计
+    Stats(StatsOpt),
+}
 
-  # 多国家过滤
-  rfw -i wlan0 --countries CN,RU,KP --block-http --block-socks5
+#[derive(Debug, Parser)]
+struct StatsOpt {
+    /// 按端口号过滤
+    #[clap(short, long)]
+    port: Option<u16>,
 
-  # 不限国家的协议过滤
-  rfw -i eth0 --block-http --block-socks5
+    /// 按源 IP 地址过滤
+    #[clap(short, long)]
+    ip: Option<String>,
 
-  # 全面防护(阻止所有来自指定国家的流量)
-  rfw -i ens33 --block-all-from CN,RU
+    /// 只显示被阻断的访问
+    #[clap(long)]
+    blocked_only: bool,
 
-  # 白名单模式(只允许指定国家)
-  rfw -i eth0 --allow-only-countries US,JP,KR --block-http
+    /// 只显示被允许的访问
+    #[clap(long)]
+    allowed_only: bool,
 
-  # 向后兼容旧命令
-  rfw -i eth0 --block-cn-http --block-cn-socks5"
-)]
-struct Opt {
+    /// 按端口分组显示
+    #[clap(short, long)]
+    group_by_port: bool,
+}
+
+#[derive(Debug, Parser)]
+struct RunOpt {
     /// 网络接口名称（如 eth0, ens33, wlan0）
     ///
     /// 使用 'ip link' 或 'ifconfig' 查看可用接口
@@ -261,16 +409,27 @@ struct Opt {
     /// 如果默认模式附加失败,请尝试使用 --xdp-mode skb
     #[clap(long, default_value = "auto")]
     xdp_mode: String,
+
+    /// 记录端口访问日志
+    ///
+    /// 启用后会记录所有端口被哪些 IP 访问，以及是否被阻断
+    /// 可以使用 `rfw-stats` 命令查看统计信息
+    #[clap(long)]
+    log_port_access: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 首先解析命令行参数，但不立即执行程序逻辑
-    let opt = Opt::parse();
+    let cli = Cli::parse();
 
-    // 检查是否是帮助或版本请求
-    // 如果是，clap 会自动处理并退出，不会执行到这里
+    // 处理子命令
+    match cli.command {
+        Some(Commands::Stats(stats_opt)) => run_stats(stats_opt),
+        None => run_firewall(cli.run_opts).await,
+    }
+}
 
+async fn run_firewall(opt: RunOpt) -> anyhow::Result<()> {
     // 只有真正运行程序时才初始化日志和 eBPF
     env_logger::init();
 
@@ -302,8 +461,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 检查是否至少启用了一个规则
-    if !opt.block_email && !opt_http && !opt_socks5 && !opt_fet_strict
-       && !opt_fet_loose && !opt_wg && !opt_quic && !opt_all
+    if !opt.block_email
+        && !opt_http
+        && !opt_socks5
+        && !opt_fet_strict
+        && !opt_fet_loose
+        && !opt_wg
+        && !opt_quic
+        && !opt_all
     {
         println!("警告: 未启用任何防火墙规则，程序将运行但不执行任何过滤操作");
         println!("使用 'rfw --help' 查看可用规则列表");
@@ -388,7 +553,10 @@ async fn main() -> anyhow::Result<()> {
         } else {
             format!("{:?} 国家", target_countries)
         };
-        info!("启用规则: 屏蔽 {} 的全加密流量入站 (严格模式 - 默认阻止)", scope);
+        info!(
+            "启用规则: 屏蔽 {} 的全加密流量入站 (严格模式 - 默认阻止)",
+            scope
+        );
     }
 
     if opt_fet_loose {
@@ -398,7 +566,10 @@ async fn main() -> anyhow::Result<()> {
         } else {
             format!("{:?} 国家", target_countries)
         };
-        info!("启用规则: 屏蔽 {} 的全加密流量入站 (宽松模式 - 默认放过)", scope);
+        info!(
+            "启用规则: 屏蔽 {} 的全加密流量入站 (宽松模式 - 默认放过)",
+            scope
+        );
     }
 
     if opt_wg {
@@ -431,6 +602,20 @@ async fn main() -> anyhow::Result<()> {
         info!("启用规则: 屏蔽 {} 的所有入站流量", scope);
     }
 
+    if opt.log_port_access {
+        config_flags |= rfw_common::RULE_LOG_PORT_ACCESS;
+        info!("启用规则: 记录端口访问日志");
+
+        // Pin PORT_ACCESS_LOG map 到 bpffs 以便其他进程访问
+        let port_access_map = ebpf
+            .map("PORT_ACCESS_LOG")
+            .context("无法找到 PORT_ACCESS_LOG map")?;
+        port_access_map
+            .pin("/sys/fs/bpf/rfw_port_access_log")
+            .context("无法 pin PORT_ACCESS_LOG map，请确保 /sys/fs/bpf 已挂载且有写权限")?;
+        info!("已将端口访问日志 map pin 到 /sys/fs/bpf/rfw_port_access_log");
+    }
+
     // 将配置写入 eBPF map
     let mut config_map: Array<_, u32> = ebpf.map_mut("CONFIG").unwrap().try_into()?;
     config_map.set(0, config_flags, 0)?;
@@ -438,7 +623,10 @@ async fn main() -> anyhow::Result<()> {
 
     // 如果需要 GeoIP 规则，从网络下载 IP 段数据
     if !target_countries.is_empty() {
-        info!("检测到需要 GeoIP 规则，正在下载 {:?} 的 IP 数据...", target_countries);
+        info!(
+            "检测到需要 GeoIP 规则，正在下载 {:?} 的 IP 数据...",
+            target_countries
+        );
 
         // 批量下载所有国家的 GeoIP 数据
         let geo_data_list = fetch_multiple_geoip_data(&target_countries)
@@ -497,7 +685,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let Opt { iface, xdp_mode, .. } = opt;
+    let RunOpt {
+        iface, xdp_mode, ..
+    } = opt;
 
     // 根据用户选择确定 XDP 模式
     let xdp_flags = match xdp_mode.to_lowercase().as_str() {
@@ -536,6 +726,15 @@ async fn main() -> anyhow::Result<()> {
     println!("防火墙运行中，按 Ctrl-C 退出...");
     ctrl_c.await?;
     println!("退出中...");
+
+    // 清理 pinned map
+    if opt.log_port_access {
+        if let Err(e) = std::fs::remove_file("/sys/fs/bpf/rfw_port_access_log") {
+            warn!("清理 pinned map 失败: {}", e);
+        } else {
+            info!("已清理端口访问日志 map");
+        }
+    }
 
     Ok(())
 }

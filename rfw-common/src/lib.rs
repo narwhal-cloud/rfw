@@ -20,6 +20,7 @@ pub const RULE_BLOCK_QUIC: u32 = 1 << 7; // 屏蔽 QUIC 入站(配合 GeoIP 或�
 // GeoIP 过滤模式
 pub const RULE_GEOIP_ENABLED: u32 = 1 << 8; // 启用 GeoIP 国家过滤
 pub const RULE_GEOIP_WHITELIST: u32 = 1 << 9; // GeoIP 白名单模式(只允许列表中的国家)
+pub const RULE_LOG_PORT_ACCESS: u32 = 1 << 10; // 记录端口访问日志
 
 impl FirewallConfig {
     pub fn new() -> Self {
@@ -45,10 +46,10 @@ impl Default for FirewallConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct GeoIpEntry {
-    pub start_ip: u32,      // 起始 IP (网络字节序)
-    pub end_ip: u32,        // 结束 IP (网络字节序)
-    pub country_code: u16,  // 国家代码(两字母 ISO 3166-1 alpha-2,如 CN=0x434E, US=0x5553)
-    pub _padding: u16,      // 对齐填充
+    pub start_ip: u32,     // 起始 IP (网络字节序)
+    pub end_ip: u32,       // 结束 IP (网络字节序)
+    pub country_code: u16, // 国家代码(两字母 ISO 3166-1 alpha-2,如 CN=0x434E, US=0x5553)
+    pub _padding: u16,     // 对齐填充
 }
 
 // 为 GeoIpEntry 实现 Pod trait，使其可以在 eBPF map 中使用
@@ -65,3 +66,28 @@ pub struct LpmTrieKey {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LpmTrieKey {}
+
+/// 端口访问记录的 Key
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PortAccessKey {
+    pub dst_port: u16,
+    pub protocol: u8,
+    pub _padding: u8,
+    pub src_ip: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortAccessKey {}
+
+/// 端口访问统计信息
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PortAccessStats {
+    pub allowed_count: u64, // 允许通过的次数
+    pub blocked_count: u64, // 被阻断的次数
+    pub last_seen: u64,     // 最后访问时间（保留，暂时未使用）
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortAccessStats {}
