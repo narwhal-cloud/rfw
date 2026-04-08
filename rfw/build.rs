@@ -1,7 +1,14 @@
 use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
+use std::env;
 
 fn main() -> anyhow::Result<()> {
+    // 增加 BPF 栈大小限制以避免 "stack limit exceeded" 错误
+    // BPF 默认栈大小是 512 字节，增加到 2048 字节
+    unsafe {
+        env::set_var("LLVMFLAGS", "-bpf-stack-size=2048");
+    }
+
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()
@@ -21,6 +28,8 @@ fn main() -> anyhow::Result<()> {
             .parent()
             .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
             .as_str(),
+        features: &[],
+        no_default_features: false,
     };
     aya_build::build_ebpf([ebpf_package], Toolchain::default())
 }

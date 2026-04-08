@@ -18,18 +18,23 @@ aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
 aya-log = { git = "https://github.com/aya-rs/aya", default-features = false }
 aya-log-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
 
-anyhow = { version = "1.0.100", default-features = false }
+anyhow = { version = "1.0.102", default-features = false }
 cargo_metadata = { version = "0.23.1", default-features = false }
 # `std` feature is currently required to build `clap`.
 #
 # See https://github.com/clap-rs/clap/blob/61f5ee5/clap_builder/src/lib.rs#L15.
-clap = { version = "4.5.53", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive"] }
-env_logger = { version = "0.11.8", default-features = false }
-libc = { version = "0.2.177", default-features = false }
-log = { version = "0.4.28", default-features = false }
-tokio = { version = "1.48.0", default-features = false }
-which = { version = "6.0.3", default-features = false }
+clap = { version = "4.6.0", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive"] }
+env_logger = { version = "0.11.10", default-features = false }
+libc = { version = "1.0.0-alpha.3", default-features = false }
+log = { version = "0.4.29", default-features = false }
+tokio = { version = "1.51.1", default-features = false }
+which = { version = "8.0.2", default-features = false }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
 
 [profile.release.package.rfw-ebpf]
-debug = 2
-codegen-units = 1
+debug = 0
+opt-level = "z"

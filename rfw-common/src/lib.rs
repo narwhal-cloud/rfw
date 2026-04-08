@@ -22,6 +22,11 @@ pub const RULE_GEOIP_ENABLED: u32 = 1 << 8; // 启用 GeoIP 国家过滤
 pub const RULE_GEOIP_WHITELIST: u32 = 1 << 9; // GeoIP 白名单模式(只允许列表中的国家)
 pub const RULE_LOG_PORT_ACCESS: u32 = 1 << 10; // 记录端口访问日志
 
+// 新增规则
+pub const RULE_BLOCK_EGRESS: u32 = 1 << 11; // 启用出站流量过滤 (TC)
+pub const RULE_PORT_FORWARD: u32 = 1 << 12; // 启用端口转发 (DNAT)
+pub const RULE_BLOCK_SNI: u32 = 1 << 13; // 启用域名封禁 (SNI)
+
 impl FirewallConfig {
     pub fn new() -> Self {
         Self { flags: 0 }
@@ -91,3 +96,39 @@ pub struct PortAccessStats {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PortAccessStats {}
+
+/// 端口转发 Key
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PortForwardKey {
+    pub dst_port: u16,
+    pub protocol: u8,
+    pub _padding: u8,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortForwardKey {}
+
+/// 端口转发 Value
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PortForwardValue {
+    pub new_dst_ip: u32,
+    pub new_dst_port: u16,
+    pub _padding: [u8; 2],
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortForwardValue {}
+
+/// 端口封禁 Key
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PortBlockKey {
+    pub port: u16,
+    pub protocol: u8,
+    pub direction: u8, // 0 = Inbound, 1 = Outbound, 2 = Both
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortBlockKey {}

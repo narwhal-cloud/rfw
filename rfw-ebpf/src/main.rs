@@ -2,23 +2,50 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::xdp_action,
-    macros::{map, xdp},
-    maps::{Array, LpmTrie, LruHashMap, lpm_trie::Key},
-    programs::XdpContext,
+    bindings::{xdp_action},
+    macros::{map, xdp, classifier},
+    maps::{Array, LpmTrie, LruHashMap, HashMap, lpm_trie::Key},
+    programs::{XdpContext, TcContext},
 };
 use aya_log_ebpf::{debug, info};
 use core::mem::size_of;
+use rfw_common::{PortForwardKey, PortForwardValue};
 
 // 防火墙配置 map
 #[map]
 static CONFIG: Array<u32> = Array::with_max_entries(1, 0);
+
+// 端口转发 map
+#[map]
+static FORWARD_RULES: HashMap<PortForwardKey, PortForwardValue> = HashMap::with_max_entries(1024, 0);
+
+// 端口封禁 map
+#[map]
+static BLOCK_PORTS: HashMap<rfw_common::PortBlockKey, u8> = HashMap::with_max_entries(1024, 0);
+
+// 域名黑名单 map (存储 SNI 的前 64 字节)
+#[map]
+static DOMAIN_BLACKLIST: HashMap<[u8; 64], u8> = HashMap::with_max_entries(1024, 0);
 
 // GeoIP 数据 map - 国家 IP 段（使用 LpmTrie 进行高效前缀匹配）
 // LpmTrie key: prefix_len (4 bytes) + IP address (4 bytes)
 // value: u8 (1 = 匹配的IP)
 #[map]
 static GEOIP_MAP: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
+
+// 端口特定的协议检测规则 map
+// Key: 目标端口号 (u16)
+// Value: 应该在该端口执行的协议检测 flags (u32, 与 CONFIG flags 中的协议位相同)
+// 例如: PORT_PROTO_FLAGS[1080] = RULE_BLOCK_SOCKS5，表示在 1080 端口执行 SOCKS5 检测
+#[map]
+static PORT_PROTO_FLAGS: HashMap<u16, u32> = HashMap::with_max_entries(1024, 0);
+
+// 端口特定的白名单协议规则 map
+// Key: 目标端口号 (u16)
+// Value: 该端口允许的协议 flags (u32, 与 CONFIG flags 中的协议位相同)
+// 例如: PORT_PROTO_ALLOW_FLAGS[1080] = RULE_BLOCK_SOCKS5，表示在 1080 端口允许 SOCKS5
+#[map]
+static PORT_PROTO_ALLOW_FLAGS: HashMap<u16, u32> = HashMap::with_max_entries(1024, 0);
 
 // TCP 连接跟踪 map - 记录已检测过的连接（五元组）
 // 使用 LRU 策略自动淘汰旧连接
@@ -132,18 +159,27 @@ const ETH_P_IP: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
+// TC action codes
+const _TC_ACT_OK: i32 = 0;
+const _TC_ACT_RECLASSIFY: i32 = 1;
+const TC_ACT_SHOT: i32 = 2;
+const TC_ACT_PIPE: i32 = 3;
+
 // 规则标志位
-const RULE_BLOCK_EMAIL: u32 = 1 << 0;
-const RULE_BLOCK_HTTP: u32 = 1 << 1;
-const RULE_BLOCK_SOCKS5: u32 = 1 << 2;
-const RULE_BLOCK_FET_STRICT: u32 = 1 << 3; // FET 严格模式（默认阻止）
-const RULE_BLOCK_WIREGUARD: u32 = 1 << 4;
-const RULE_BLOCK_ALL: u32 = 1 << 5;
-const RULE_BLOCK_FET_LOOSE: u32 = 1 << 6; // FET 宽松模式（默认放过）
-const RULE_BLOCK_QUIC: u32 = 1 << 7;
-const RULE_GEOIP_ENABLED: u32 = 1 << 8; // 启用 GeoIP 国家过滤
-const RULE_GEOIP_WHITELIST: u32 = 1 << 9; // GeoIP 白名单模式
-const RULE_LOG_PORT_ACCESS: u32 = 1 << 10; // 记录端口访问日志
+const RULE_BLOCK_EMAIL: u32 = rfw_common::RULE_BLOCK_EMAIL;
+const RULE_BLOCK_HTTP: u32 = rfw_common::RULE_BLOCK_HTTP;
+const RULE_BLOCK_SOCKS5: u32 = rfw_common::RULE_BLOCK_SOCKS5;
+const RULE_BLOCK_FET_STRICT: u32 = rfw_common::RULE_BLOCK_FET_STRICT;
+const RULE_BLOCK_WIREGUARD: u32 = rfw_common::RULE_BLOCK_WIREGUARD;
+const RULE_BLOCK_ALL: u32 = rfw_common::RULE_BLOCK_ALL;
+const RULE_BLOCK_FET_LOOSE: u32 = rfw_common::RULE_BLOCK_FET_LOOSE;
+const RULE_BLOCK_QUIC: u32 = rfw_common::RULE_BLOCK_QUIC;
+const RULE_GEOIP_ENABLED: u32 = rfw_common::RULE_GEOIP_ENABLED;
+const RULE_GEOIP_WHITELIST: u32 = rfw_common::RULE_GEOIP_WHITELIST;
+const RULE_LOG_PORT_ACCESS: u32 = rfw_common::RULE_LOG_PORT_ACCESS;
+const RULE_BLOCK_EGRESS: u32 = rfw_common::RULE_BLOCK_EGRESS;
+const RULE_PORT_FORWARD: u32 = rfw_common::RULE_PORT_FORWARD;
+const RULE_BLOCK_SNI: u32 = rfw_common::RULE_BLOCK_SNI;
 
 // WireGuard 协议常量
 const WG_TYPE_HANDSHAKE_INIT: u8 = 1;
@@ -164,6 +200,90 @@ pub fn rfw(ctx: XdpContext) -> u32 {
     }
 }
 
+#[classifier]
+pub fn rfw_egress(ctx: TcContext) -> i32 {
+    match try_rfw_egress(ctx) {
+        Ok(ret) => ret,
+        Err(_) => TC_ACT_PIPE,
+    }
+}
+
+fn try_rfw_egress(ctx: TcContext) -> Result<i32, ()> {
+    let config_flags = CONFIG.get(0).ok_or(())?;
+    if (*config_flags & RULE_BLOCK_EGRESS) == 0 {
+        return Ok(TC_ACT_PIPE);
+    }
+
+    // 解析基础头部以进行初步过滤
+    let eth_hdr = ptr_at_tc::<EthHdr>(&ctx, 0)?;
+    let eth_proto = u16::from_be(unsafe { (*eth_hdr).h_proto });
+    if eth_proto != ETH_P_IP {
+        return Ok(TC_ACT_PIPE);
+    }
+
+    let ip_hdr = ptr_at_tc::<IpHdr>(&ctx, size_of::<EthHdr>())?;
+    let protocol = unsafe { (*ip_hdr).protocol };
+
+    // IP 头长度
+    let ihl = unsafe { (*ip_hdr)._bitfield & 0x0F };
+    let ip_hdr_len = (ihl as usize) * 4;
+    if ip_hdr_len < 20 || ip_hdr_len > 60 {
+        return Ok(TC_ACT_PIPE);
+    }
+
+    match protocol {
+        IPPROTO_TCP => {
+            let tcp_hdr = ptr_at_tc::<TcpHdr>(&ctx, size_of::<EthHdr>() + ip_hdr_len)?;
+            let dst_port = u16::from_be(unsafe { (*tcp_hdr).dest });
+
+            // 检查特定端口封禁 (Outbound or Both)
+            let key = rfw_common::PortBlockKey {
+                port: dst_port,
+                protocol: IPPROTO_TCP,
+                direction: 1, // Outbound
+            };
+            if unsafe { BLOCK_PORTS.get(&key).is_some() } {
+                return Ok(TC_ACT_SHOT);
+            }
+
+            let key_both = rfw_common::PortBlockKey {
+                port: dst_port,
+                protocol: IPPROTO_TCP,
+                direction: 2, // Both
+            };
+            if unsafe { BLOCK_PORTS.get(&key_both).is_some() } {
+                return Ok(TC_ACT_SHOT);
+            }
+        }
+        IPPROTO_UDP => {
+            let udp_hdr = ptr_at_tc::<UdpHdr>(&ctx, size_of::<EthHdr>() + ip_hdr_len)?;
+            let dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
+
+            // 检查特定端口封禁 (Outbound or Both)
+            let key = rfw_common::PortBlockKey {
+                port: dst_port,
+                protocol: IPPROTO_UDP,
+                direction: 1, // Outbound
+            };
+            if unsafe { BLOCK_PORTS.get(&key).is_some() } {
+                return Ok(TC_ACT_SHOT);
+            }
+
+            let key_both = rfw_common::PortBlockKey {
+                port: dst_port,
+                protocol: IPPROTO_UDP,
+                direction: 2, // Both
+            };
+            if unsafe { BLOCK_PORTS.get(&key_both).is_some() } {
+                return Ok(TC_ACT_SHOT);
+            }
+        }
+        _ => {}
+    }
+
+    Ok(TC_ACT_PIPE)
+}
+
 fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
     // 读取配置
     let config_flags = CONFIG.get(0).ok_or(())?;
@@ -176,7 +296,7 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
     }
 
     // 解析 IP 头（ptr_at 内部会做边界检查）
-    let ip_hdr = ptr_at::<IpHdr>(&ctx, size_of::<EthHdr>())?;
+    let ip_hdr = ptr_at_mut::<IpHdr>(&ctx, size_of::<EthHdr>())?;
     let protocol = unsafe { (*ip_hdr).protocol };
     let src_ip = unsafe { (*ip_hdr).saddr };
 
@@ -225,9 +345,72 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
     // 根据协议解析传输层头
     match protocol {
         IPPROTO_TCP => {
-            let tcp_hdr = ptr_at::<TcpHdr>(&ctx, size_of::<EthHdr>() + ip_hdr_len)?;
-            let dst_port = u16::from_be(unsafe { (*tcp_hdr).dest });
+            let tcp_hdr = ptr_at_mut::<TcpHdr>(&ctx, size_of::<EthHdr>() + ip_hdr_len)?;
+            let mut dst_port = u16::from_be(unsafe { (*tcp_hdr).dest });
             let src_port = u16::from_be(unsafe { (*tcp_hdr).source });
+
+            // 检查特定端口封禁
+            {
+                let key = rfw_common::PortBlockKey {
+                    port: dst_port,
+                    protocol: IPPROTO_TCP,
+                    direction: 0, // Inbound
+                };
+                if unsafe { BLOCK_PORTS.get(&key).is_some() } {
+                    if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                        log_port_access(src_ip, dst_port, IPPROTO_TCP, true);
+                    }
+                    info!(&ctx, "BLOCKED: 目标端口被封禁 (TCP): {}", dst_port);
+                    return Ok(xdp_action::XDP_DROP);
+                }
+
+                // 检查 Both 模式
+                let key_both = rfw_common::PortBlockKey {
+                    port: dst_port,
+                    protocol: IPPROTO_TCP,
+                    direction: 2, // Both
+                };
+                if unsafe { BLOCK_PORTS.get(&key_both).is_some() } {
+                    if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                        log_port_access(src_ip, dst_port, IPPROTO_TCP, true);
+                    }
+                    info!(&ctx, "BLOCKED: 目标端口被封禁 (TCP Both): {}", dst_port);
+                    return Ok(xdp_action::XDP_DROP);
+                }
+            }
+
+            // 检查端口转发规则 (DNAT)
+            if (*config_flags & RULE_PORT_FORWARD) != 0 {
+                let key = PortForwardKey {
+                    dst_port,
+                    protocol: IPPROTO_TCP,
+                    _padding: 0,
+                };
+                if let Some(rule) = unsafe { FORWARD_RULES.get(&key) } {
+                    unsafe {
+                        let old_dst_ip = (*ip_hdr).daddr;
+                        let new_dst_ip = rule.new_dst_ip;
+                        let old_dst_port = (*tcp_hdr).dest;
+                        let new_dst_port = u16::to_be(rule.new_dst_port);
+
+                        // 更新 IP 头 (daddr + check)
+                        (*ip_hdr).daddr = new_dst_ip;
+                        (*ip_hdr).check = update_csum((*ip_hdr).check, old_dst_ip, new_dst_ip);
+
+                        // 更新 TCP 头 (dest + check)
+                        (*tcp_hdr).dest = new_dst_port;
+                        // TCP/UDP 校验和包含伪首部 (IP 地址), 需要更新
+                        (*tcp_hdr).check = update_csum((*tcp_hdr).check, old_dst_ip, new_dst_ip);
+                        (*tcp_hdr).check = update_csum((*tcp_hdr).check, old_dst_port as u32, new_dst_port as u32);
+
+                        info!(&ctx, "FORWARD: TCP {}:{} -> {}:{}", u32::from_be(src_ip), dst_port, u32::from_be(new_dst_ip), rule.new_dst_port);
+
+                        // 更新变量供后续逻辑使用
+                        dst_port = rule.new_dst_port;
+                    }
+                }
+            }
+
             // 获取 TCP 头长度（data offset 字段在 _bitfield 的高4位，单位是4字节）
             let tcp_data_offset = (u16::from_be(unsafe { (*tcp_hdr)._bitfield }) >> 12) as usize;
             let tcp_hdr_len = tcp_data_offset * 4;
@@ -260,12 +443,23 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
             }
 
             // 协议深度检测（HTTP/SOCKS5/FET）- 使用连接跟踪避免误判
+            // 先检查端口特定的协议检测规则，如果没有则使用全局配置
+            let effective_flags = unsafe {
+                if let Some(&port_flags) = PORT_PROTO_FLAGS.get(&dst_port) {
+                    // 端口特定规则存在，使用端口特定的 flags
+                    port_flags
+                } else {
+                    // 使用全局配置 flags
+                    *config_flags
+                }
+            };
+
             // 检查是否启用了任何需要协议检测的规则
-            let needs_protocol_detection = (*config_flags
+            let needs_protocol_detection = (effective_flags
                 & (RULE_BLOCK_HTTP
-                    | RULE_BLOCK_SOCKS5
-                    | RULE_BLOCK_FET_STRICT
-                    | RULE_BLOCK_FET_LOOSE))
+                | RULE_BLOCK_SOCKS5
+                | RULE_BLOCK_FET_STRICT
+                | RULE_BLOCK_FET_LOOSE))
                 != 0;
 
             unsafe {
@@ -350,9 +544,10 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
 
                             // 新连接，需要进行协议检测（已确保有payload）
                             let mut should_block = false;
+                            let mut detected_protocol = 0u32;
 
                             // 检查 HTTP 入站屏蔽规则
-                            if (*config_flags & RULE_BLOCK_HTTP) != 0 && payload_size >= 4 {
+                            if (effective_flags & RULE_BLOCK_HTTP) != 0 && payload_size >= 4 {
                                 if is_http_request(&ctx, payload_offset)? {
                                     info!(
                                         &ctx,
@@ -362,12 +557,29 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                                         dst_port
                                     );
                                     should_block = true;
+                                    detected_protocol = RULE_BLOCK_HTTP;
+                                }
+                            }
+
+                            // 检查域名封禁 (SNI)
+                            if !should_block && (*config_flags & RULE_BLOCK_SNI) != 0 && payload_size >= 16 {
+                                if let Ok(Some(sni)) = extract_sni(&ctx, payload_offset) {
+                                    if DOMAIN_BLACKLIST.get(&sni).is_some() {
+                                        info!(
+                                            &ctx,
+                                            "BLOCKED: 访问黑名单域名 (SNI), 源 {:i}:{} -> 目标端口 {}",
+                                            u32::from_be(src_ip),
+                                            src_port,
+                                            dst_port
+                                        );
+                                        should_block = true;
+                                    }
                                 }
                             }
 
                             // 检查 SOCKS5 入站屏蔽规则
                             if !should_block
-                                && (*config_flags & RULE_BLOCK_SOCKS5) != 0
+                                && (effective_flags & RULE_BLOCK_SOCKS5) != 0
                                 && payload_size >= 2
                             {
                                 if is_socks5_request(&ctx, payload_offset)? {
@@ -379,6 +591,7 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                                         dst_port
                                     );
                                     should_block = true;
+                                    detected_protocol = RULE_BLOCK_SOCKS5;
                                 }
                             }
 
@@ -386,8 +599,8 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                             // FET 检测需要至少 16 字节
                             if !should_block && payload_size >= 16 {
                                 // 判断模式：严格或宽松
-                                let strict_mode = (*config_flags & RULE_BLOCK_FET_STRICT) != 0;
-                                let loose_mode = (*config_flags & RULE_BLOCK_FET_LOOSE) != 0;
+                                let strict_mode = (effective_flags & RULE_BLOCK_FET_STRICT) != 0;
+                                let loose_mode = (effective_flags & RULE_BLOCK_FET_LOOSE) != 0;
 
                                 if strict_mode || loose_mode {
                                     if is_fully_encrypted_traffic(
@@ -410,6 +623,7 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                                             dst_port
                                         );
                                         should_block = true;
+                                        detected_protocol = if strict_mode { RULE_BLOCK_FET_STRICT } else { RULE_BLOCK_FET_LOOSE };
                                     }
                                 }
                             }
@@ -417,6 +631,16 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                             if payload_size <= 6 {
                                 return Ok(xdp_action::XDP_PASS);
                             }
+
+                            // 检查白名单规则：如果该协议在该端口的白名单中，则允许
+                            if should_block && detected_protocol != 0 {
+                                let allow_flags = PORT_PROTO_ALLOW_FLAGS.get(&dst_port).copied().unwrap_or(0);
+                                if (allow_flags & detected_protocol) != 0 {
+                                    // 该协议在白名单中，允许通过
+                                    should_block = false;
+                                }
+                            }
+
                             // 处理检测结果
                             if should_block {
                                 // 标记这个连接为已阻止，后续包也会被DROP
@@ -439,7 +663,72 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
         }
         IPPROTO_UDP => {
             // 处理 UDP 协议
-            let udp_hdr = ptr_at::<UdpHdr>(&ctx, size_of::<EthHdr>() + ip_hdr_len)?;
+            let udp_hdr = ptr_at_mut::<UdpHdr>(&ctx, size_of::<EthHdr>() + ip_hdr_len)?;
+            let mut dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
+            let src_port = u16::from_be(unsafe { (*udp_hdr).source });
+
+            // 检查特定端口封禁
+            {
+                let key = rfw_common::PortBlockKey {
+                    port: dst_port,
+                    protocol: IPPROTO_UDP,
+                    direction: 0, // Inbound
+                };
+                if unsafe { BLOCK_PORTS.get(&key).is_some() } {
+                    if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                        log_port_access(src_ip, dst_port, IPPROTO_UDP, true);
+                    }
+                    info!(&ctx, "BLOCKED: 目标端口被封禁 (UDP): {}", dst_port);
+                    return Ok(xdp_action::XDP_DROP);
+                }
+
+                // 检查 Both 模式
+                let key_both = rfw_common::PortBlockKey {
+                    port: dst_port,
+                    protocol: IPPROTO_UDP,
+                    direction: 2, // Both
+                };
+                if unsafe { BLOCK_PORTS.get(&key_both).is_some() } {
+                    if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
+                        log_port_access(src_ip, dst_port, IPPROTO_UDP, true);
+                    }
+                    info!(&ctx, "BLOCKED: 目标端口被封禁 (UDP Both): {}", dst_port);
+                    return Ok(xdp_action::XDP_DROP);
+                }
+            }
+
+            // 检查端口转发规则 (DNAT)
+            if (*config_flags & RULE_PORT_FORWARD) != 0 {
+                let key = PortForwardKey {
+                    dst_port,
+                    protocol: IPPROTO_UDP,
+                    _padding: 0,
+                };
+                if let Some(rule) = unsafe { FORWARD_RULES.get(&key) } {
+                    unsafe {
+                        let old_dst_ip = (*ip_hdr).daddr;
+                        let new_dst_ip = rule.new_dst_ip;
+                        let old_dst_port = (*udp_hdr).dest;
+                        let new_dst_port = u16::to_be(rule.new_dst_port);
+
+                        // 更新 IP 头
+                        (*ip_hdr).daddr = new_dst_ip;
+                        (*ip_hdr).check = update_csum((*ip_hdr).check, old_dst_ip, new_dst_ip);
+
+                        // 更新 UDP 头
+                        (*udp_hdr).dest = new_dst_port;
+                        // UDP 校验和 (如果是 0 则跳过，因为 UDP 校验和在 IPv4 中是可选的)
+                        if (*udp_hdr).check != 0 {
+                            (*udp_hdr).check = update_csum((*udp_hdr).check, old_dst_ip, new_dst_ip);
+                            (*udp_hdr).check = update_csum((*udp_hdr).check, old_dst_port as u32, new_dst_port as u32);
+                        }
+
+                        info!(&ctx, "FORWARD: UDP {}:{} -> {}:{}", u32::from_be(src_ip), dst_port, u32::from_be(new_dst_ip), rule.new_dst_port);
+
+                        dst_port = rule.new_dst_port;
+                    }
+                }
+            }
 
             // UDP payload 的起始位置
             let payload_offset = size_of::<EthHdr>() + ip_hdr_len + size_of::<UdpHdr>();
@@ -460,8 +749,6 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                 };
 
                 if should_check_wg && is_wireguard_packet(&ctx, payload_offset)? {
-                    let src_port = u16::from_be(unsafe { (*udp_hdr).source });
-                    let dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
                     if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
                         log_port_access(src_ip, dst_port, IPPROTO_UDP, true);
                     }
@@ -492,8 +779,6 @@ fn try_rfw(ctx: XdpContext) -> Result<u32, ()> {
                 };
 
                 if should_check_quic && is_quic_packet(&ctx, payload_offset)? {
-                    let src_port = u16::from_be(unsafe { (*udp_hdr).source });
-                    let dst_port = u16::from_be(unsafe { (*udp_hdr).dest });
                     if (*config_flags & RULE_LOG_PORT_ACCESS) != 0 {
                         log_port_access(src_ip, dst_port, IPPROTO_UDP, true);
                     }
@@ -594,6 +879,106 @@ fn is_socks5_request(ctx: &XdpContext, payload_offset: usize) -> Result<bool, ()
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
+}
+
+// 尝试从 TLS ClientHello 中提取 SNI
+// 注意：受 eBPF 栈和循环限制，这只是一个简化版，仅尝试匹配前 64 字节
+#[inline(always)]
+fn extract_sni(ctx: &XdpContext, payload_offset: usize) -> Result<Option<[u8; 64]>, ()> {
+    // TLS: 0x16 (Handshake) + 0x030x (Version) + length
+    let tls_hdr = match ptr_at::<[u8; 5]>(ctx, payload_offset) {
+        Ok(ptr) => unsafe { *ptr },
+        Err(_) => return Ok(None),
+    };
+
+    if tls_hdr[0] != 0x16 {
+        return Ok(None);
+    }
+
+    // Handshake Type: 0x01 (ClientHello)
+    let handshake_type = match ptr_at::<u8>(ctx, payload_offset + 5) {
+        Ok(ptr) => unsafe { *ptr },
+        Err(_) => return Ok(None),
+    };
+
+    if handshake_type != 0x01 {
+        return Ok(None);
+    }
+
+    // 跳过 Handshake 头部 (4) + Version (2) + Random (32)
+    let mut offset = payload_offset + 5 + 4 + 2 + 32;
+
+    // Session ID Length (1) + Session ID
+    let session_id_len = match ptr_at::<u8>(ctx, offset) {
+        Ok(ptr) => unsafe { *ptr as usize },
+        Err(_) => return Ok(None),
+    };
+    offset += 1 + session_id_len;
+
+    // Cipher Suites Length (2) + Cipher Suites
+    let cipher_suites_len = match ptr_at::<u16>(ctx, offset) {
+        Ok(ptr) => u16::from_be(unsafe { *ptr }) as usize,
+        Err(_) => return Ok(None),
+    };
+    offset += 2 + cipher_suites_len;
+
+    // Compression Methods Length (1) + Compression Methods
+    let compression_methods_len = match ptr_at::<u8>(ctx, offset) {
+        Ok(ptr) => unsafe { *ptr as usize },
+        Err(_) => return Ok(None),
+    };
+    offset += 1 + compression_methods_len;
+
+    // Extensions Length (2)
+    let _extensions_len = match ptr_at::<u16>(ctx, offset) {
+        Ok(ptr) => u16::from_be(unsafe { *ptr }) as usize,
+        Err(_) => return Ok(None),
+    };
+    offset += 2;
+
+    // 遍历扩展寻找 SNI (Type 0x0000)
+    // 为满足 eBPF verifier，手动展开有限次尝试
+    for _ in 0..8 {
+        if offset + 4 > payload_offset + 500 { // 限制解析范围
+            break;
+        }
+
+        let ext_type = match ptr_at::<u16>(ctx, offset) {
+            Ok(ptr) => u16::from_be(unsafe { *ptr }),
+            Err(_) => break,
+        };
+        let ext_len = match ptr_at::<u16>(ctx, offset + 2) {
+            Ok(ptr) => u16::from_be(unsafe { *ptr }) as usize,
+            Err(_) => break,
+        };
+
+        if ext_type == 0x0000 {
+            // 找到 SNI 扩展
+            // ServerName List Length (2) + Type (1) + Name Length (2)
+            let name_len = match ptr_at::<u16>(ctx, offset + 4 + 2 + 1) {
+                Ok(ptr) => u16::from_be(unsafe { *ptr }) as usize,
+                Err(_) => break,
+            };
+
+            let mut name = [0u8; 64];
+            let actual_len = if name_len > 64 { 64 } else { name_len };
+
+            // 读取域名内容
+            for i in 0..64 {
+                if i >= actual_len {
+                    break;
+                }
+                if let Ok(b) = ptr_at::<u8>(ctx, offset + 4 + 2 + 1 + 2 + i) {
+                    name[i] = unsafe { *b };
+                }
+            }
+            return Ok(Some(name));
+        }
+
+        offset += 4 + ext_len;
+    }
+
+    Ok(None)
 }
 
 // 检查 IP 是否匹配 GeoIP 列表
@@ -1103,6 +1488,56 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     }
 
     Ok((start + offset) as *const T)
+}
+
+// 辅助函数：从数据包中获取指定偏移的指针 (TC 版)
+#[inline(always)]
+fn ptr_at_tc<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    let len = size_of::<T>();
+
+    if start + offset + len > end {
+        return Err(());
+    }
+
+    Ok((start + offset) as *const T)
+}
+
+// 辅助函数：从数据包中获取指定偏移的可变指针
+#[inline(always)]
+fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    let len = size_of::<T>();
+
+    if start + offset + len > end {
+        return Err(());
+    }
+
+    Ok((start + offset) as *mut T)
+}
+
+// 增量更新 IP 校验和 (RFC 1624)
+// new_csum = ~(~old_csum + ~old_val + new_val)
+#[inline(always)]
+fn update_csum(old_csum: u16, old_val: u32, new_val: u32) -> u16 {
+    let mut sum = !u16::from_be(old_csum) as u32;
+
+    // 减去旧值 (使用取反加法)
+    sum = sum.wrapping_add(! (old_val & 0xFFFF) as u32);
+    sum = sum.wrapping_add(! (old_val >> 16) as u32);
+
+    // 加上新值
+    sum = sum.wrapping_add((new_val & 0xFFFF) as u32);
+    sum = sum.wrapping_add((new_val >> 16) as u32);
+
+    // 处理进位
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    u16::to_be(!(sum as u16))
 }
 
 #[cfg(not(test))]
