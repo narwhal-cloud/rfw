@@ -12,9 +12,27 @@ pub const PROTO_ALL: u8 = 0;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
 
-// 应用层协议（自定义编号）
-pub const PROTO_HTTP: u8 = 80;
-pub const PROTO_SOCKS5: u8 = 108;
+// 应用层协议（自定义编号，128+ 避免与 IANA IPPROTO 冲突）
+pub const PROTO_HTTP: u8 = 128;
+pub const PROTO_TLS: u8 = 129;
+pub const PROTO_SOCKS5: u8 = 130;
+pub const PROTO_FET: u8 = 131; // Fully Encrypted Traffic
+
+/// 连接跟踪 Key (5-tuple)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ConnKey {
+    pub local_ip: u32,
+    pub remote_ip: u32,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub protocol: u8,
+    pub direction: u8,
+    pub _padding: [u8; 2], // 显式对齐到 16 字节
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ConnKey {}
 
 // HTTP 方法特征值 (大端序 u32)
 pub const HTTP_GET: u32 = 0x47455420;     // "GET "

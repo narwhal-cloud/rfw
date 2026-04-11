@@ -1,12 +1,12 @@
 openapi: 3.0.3
 info:
   title: RFW 防火墙 API
-  version: 2.0.0
+  version: 2.1.0
   description: |
     # RFW - 基于 eBPF/XDP 的高性能防火墙 API 文档
 
     基于 Rust 和 aya 开发的高性能防火墙控制接口。
-    支持实时规则同步、GeoIP 自动化下载和 CIDR 匹配。
+    支持实时规则同步、连接状态跟踪（Action Caching）、应用层协议识别（DPI）和 GeoIP 自动化过滤。
 
   contact:
     name: RFW 项目
@@ -75,7 +75,7 @@ paths:
         '400':
           description: 参数错误
         '500':
-          description: 内部处理错误（如 GeoIP 下载失败或 eBPF 同步失败）
+          description: 内部处理错误
 
   /api/rules/{id}:
     delete:
@@ -103,8 +103,14 @@ components:
 
     Protocol:
       type: string
-      enum: [tcp, udp, all]
-      description: 协议类型
+      enum: [tcp, udp, http, socks5, fet, all]
+      description: |
+        协议类型：
+        - `tcp`/`udp`: 基础传输层协议
+        - `http`: 识别常见的 HTTP 方法特征
+        - `socks5`: 识别 SOCKS5 握手特征
+        - `fet`: Fully Encrypted Traffic (识别高熵加密流量，如混淆后的代理)
+        - `all`: 匹配所有协议
 
     Action:
       type: string
@@ -185,7 +191,6 @@ components:
           description: 结束端口，默认等于 port_start
         action:
           $ref: '#/components/schemas/Action'
-      # ip_config fields are flattened via oneOf in actual implementation
       allOf:
         - $ref: '#/components/schemas/IpConfig'
 

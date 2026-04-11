@@ -4,64 +4,34 @@
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{classifier, map, xdp},
-    maps::{lpm_trie::Key, Array, LpmTrie},
+    maps::{lpm_trie::Key, Array, LpmTrie, LruHashMap},
     programs::{TcContext, XdpContext},
 };
 use core::mem::size_of;
 use rfw_common::{
-    FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, HTTP_CONNECT, HTTP_DELETE, HTTP_GET,
-    HTTP_HEAD, HTTP_OPTIONS, HTTP_PATCH, HTTP_POST, HTTP_PUT, IP_TYPE_ANY, IP_TYPE_CIDR,
-    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_HTTP, PROTO_SOCKS5, SOCKS5_VERSION,
+    ConnKey, FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, HTTP_CONNECT, HTTP_DELETE,
+    HTTP_GET, HTTP_HEAD, HTTP_OPTIONS, HTTP_PATCH, HTTP_POST, HTTP_PUT, IP_TYPE_ANY, IP_TYPE_CIDR,
+    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_FET, PROTO_HTTP, PROTO_SOCKS5, PROTO_TLS,
+    SOCKS5_VERSION,
 };
 
-// 防火墙规则数组（按优先级降序排列，index=0 为最高优先级）
 #[map]
 static RULES: Array<FirewallRule> = Array::with_max_entries(MAX_RULES, 0);
 
-// GeoIP 前缀匹配表
 #[map]
 static GEOIP_MAP: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
 
-#[repr(C)]
-struct EthHdr {
-    h_dest: [u8; 6],
-    h_source: [u8; 6],
-    h_proto: u16,
-}
+#[map]
+static CONNTRACK: LruHashMap<ConnKey, u8> = LruHashMap::with_max_entries(16384, 0);
 
 #[repr(C)]
-struct IpHdr {
-    _bitfield: u8,
-    tos: u8,
-    tot_len: u16,
-    id: u16,
-    frag_off: u16,
-    ttl: u8,
-    protocol: u8,
-    check: u16,
-    saddr: u32,
-    daddr: u32,
-}
-
+struct EthHdr { h_dest: [u8; 6], h_source: [u8; 6], h_proto: u16 }
 #[repr(C)]
-struct TcpHdr {
-    source: u16,
-    dest: u16,
-    seq: u32,
-    ack_seq: u32,
-    _bitfield: u16,
-    window: u16,
-    check: u16,
-    urg_ptr: u16,
-}
-
+struct IpHdr { _bitfield: u8, tos: u8, tot_len: u16, id: u16, frag_off: u16, ttl: u8, protocol: u8, check: u16, saddr: u32, daddr: u32 }
 #[repr(C)]
-struct UdpHdr {
-    source: u16,
-    dest: u16,
-    len: u16,
-    check: u16,
-}
+struct TcpHdr { source: u16, dest: u16, seq: u32, ack_seq: u32, _bitfield: u16, window: u16, check: u16, urg_ptr: u16 }
+#[repr(C)]
+struct UdpHdr { source: u16, dest: u16, len: u16, check: u16 }
 
 const ETH_P_IP: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
@@ -71,7 +41,9 @@ const TC_ACT_PIPE: i32 = 3;
 
 #[xdp]
 pub fn rfw(ctx: XdpContext) -> u32 {
-    match try_rfw(&ctx) {
+    let data = ctx.data() as *const u8;
+    let data_end = ctx.data_end() as *const u8;
+    match try_rfw(data, data_end) {
         Ok(ret) => ret,
         Err(_) => xdp_action::XDP_PASS,
     }
@@ -79,240 +51,191 @@ pub fn rfw(ctx: XdpContext) -> u32 {
 
 #[classifier]
 pub fn rfw_egress(ctx: TcContext) -> i32 {
-    match try_rfw_egress(&ctx) {
+    let data = ctx.data() as *const u8;
+    let data_end = ctx.data_end() as *const u8;
+    match try_rfw_egress(data, data_end) {
         Ok(ret) => ret,
         Err(_) => TC_ACT_PIPE,
     }
 }
 
-fn try_rfw(ctx: &XdpContext) -> Result<u32, ()> {
-    let eth = ptr_at::<EthHdr>(ctx, 0)?;
-    if u16::from_be(unsafe { (*eth).h_proto }) != ETH_P_IP {
-        return Ok(xdp_action::XDP_PASS);
-    }
+fn try_rfw(data: *const u8, data_end: *const u8) -> Result<u32, ()> {
+    let eth = ptr_at::<EthHdr>(data, data_end, 0)?;
+    if u16::from_be(unsafe { (*eth).h_proto }) != ETH_P_IP { return Ok(xdp_action::XDP_PASS); }
 
-    let ip = ptr_at::<IpHdr>(ctx, size_of::<EthHdr>())?;
+    let ip = ptr_at::<IpHdr>(data, data_end, 14)?;
     let protocol = unsafe { (*ip).protocol };
-    let remote_ip = unsafe { (*ip).saddr }; // 入站：源IP为对端IP
+    let (remote_ip, local_ip) = (unsafe { (*ip).saddr }, unsafe { (*ip).daddr });
     let ihl = (unsafe { (*ip)._bitfield } & 0x0F) as usize * 4;
-    if ihl < 20 || ihl > 60 {
-        return Ok(xdp_action::XDP_PASS);
-    }
+    if ihl < 20 || ihl > 60 { return Ok(xdp_action::XDP_PASS); }
 
-    let mut payload_offset = size_of::<EthHdr>() + ihl;
-    let port = match protocol {
+    let mut payload_offset = 14 + ihl;
+    let (local_port, remote_port) = match protocol {
         IPPROTO_TCP => {
-            let tcp = ptr_at::<TcpHdr>(ctx, payload_offset)?;
-            payload_offset += (u16::from_be(unsafe { (*tcp)._bitfield }) >> 12) as usize * 4;
-            u16::from_be(unsafe { (*tcp).dest })
+            let tcp = ptr_at::<TcpHdr>(data, data_end, payload_offset)?;
+            let doff = ((u16::from_be(unsafe { (*tcp)._bitfield }) >> 12) & 0xF) as usize * 4;
+            if doff < 20 || doff > 60 { return Err(()); }
+            let res = (u16::from_be(unsafe { (*tcp).dest }), u16::from_be(unsafe { (*tcp).source }));
+            payload_offset += doff;
+            res
         }
         IPPROTO_UDP => {
-            let udp = ptr_at::<UdpHdr>(ctx, payload_offset)?;
-            payload_offset += size_of::<UdpHdr>();
-            u16::from_be(unsafe { (*udp).dest })
+            let udp = ptr_at::<UdpHdr>(data, data_end, payload_offset)?;
+            let res = (u16::from_be(unsafe { (*udp).dest }), u16::from_be(unsafe { (*udp).source }));
+            payload_offset += 8;
+            res
         }
-        _ => 0,
+        _ => (0, 0),
     };
 
-    let ctx_data = (ctx.data() as *const u8, ctx.data_end() as *const u8);
-    if apply_rules(ctx_data, payload_offset, remote_ip, protocol, port, DIR_IN) == ACTION_BLOCK {
-        Ok(xdp_action::XDP_DROP)
-    } else {
-        Ok(xdp_action::XDP_PASS)
+    let key = ConnKey { local_ip, remote_ip, local_port, remote_port, protocol, direction: DIR_IN, _padding: [0; 2] };
+    if let Some(&action) = unsafe { CONNTRACK.get(&key) } {
+        return Ok(if action == ACTION_BLOCK { xdp_action::XDP_DROP } else { xdp_action::XDP_PASS });
     }
+
+    let app_proto = detect_app_proto(data, data_end, protocol, payload_offset);
+    let action = apply_rules(remote_ip, protocol, app_proto, local_port, DIR_IN);
+
+    if action == ACTION_BLOCK || app_proto != 0 { let _ = CONNTRACK.insert(&key, &action, 0); }
+    Ok(if action == ACTION_BLOCK { xdp_action::XDP_DROP } else { xdp_action::XDP_PASS })
 }
 
-fn try_rfw_egress(ctx: &TcContext) -> Result<i32, ()> {
-    let eth = ptr_at_tc::<EthHdr>(ctx, 0)?;
-    if u16::from_be(unsafe { (*eth).h_proto }) != ETH_P_IP {
-        return Ok(TC_ACT_PIPE);
-    }
+fn try_rfw_egress(data: *const u8, data_end: *const u8) -> Result<i32, ()> {
+    let eth = ptr_at::<EthHdr>(data, data_end, 0)?;
+    if u16::from_be(unsafe { (*eth).h_proto }) != ETH_P_IP { return Ok(TC_ACT_PIPE); }
 
-    let ip = ptr_at_tc::<IpHdr>(ctx, size_of::<EthHdr>())?;
+    let ip = ptr_at::<IpHdr>(data, data_end, 14)?;
     let protocol = unsafe { (*ip).protocol };
-    let remote_ip = unsafe { (*ip).daddr }; // 出站：目标IP为对端IP
+    let (local_ip, remote_ip) = (unsafe { (*ip).saddr }, unsafe { (*ip).daddr });
     let ihl = (unsafe { (*ip)._bitfield } & 0x0F) as usize * 4;
-    if ihl < 20 || ihl > 60 {
-        return Ok(TC_ACT_PIPE);
-    }
+    if ihl < 20 || ihl > 60 { return Ok(TC_ACT_PIPE); }
 
-    let mut payload_offset = size_of::<EthHdr>() + ihl;
-    let port = match protocol {
+    let mut payload_offset = 14 + ihl;
+    let (local_port, remote_port) = match protocol {
         IPPROTO_TCP => {
-            let tcp = ptr_at_tc::<TcpHdr>(ctx, payload_offset)?;
-            payload_offset += (u16::from_be(unsafe { (*tcp)._bitfield }) >> 12) as usize * 4;
-            u16::from_be(unsafe { (*tcp).dest })
+            let tcp = ptr_at::<TcpHdr>(data, data_end, payload_offset)?;
+            let doff = ((u16::from_be(unsafe { (*tcp)._bitfield }) >> 12) & 0xF) as usize * 4;
+            if doff < 20 || doff > 60 { return Err(()); }
+            let res = (u16::from_be(unsafe { (*tcp).source }), u16::from_be(unsafe { (*tcp).dest }));
+            payload_offset += doff;
+            res
         }
         IPPROTO_UDP => {
-            let udp = ptr_at_tc::<UdpHdr>(ctx, payload_offset)?;
-            payload_offset += size_of::<UdpHdr>();
-            u16::from_be(unsafe { (*udp).dest })
+            let udp = ptr_at::<UdpHdr>(data, data_end, payload_offset)?;
+            let res = (u16::from_be(unsafe { (*udp).source }), u16::from_be(unsafe { (*udp).dest }));
+            payload_offset += 8;
+            res
         }
-        _ => 0,
+        _ => (0, 0),
     };
 
-    let ctx_data = (ctx.data() as *const u8, ctx.data_end() as *const u8);
-    if apply_rules(ctx_data, payload_offset, remote_ip, protocol, port, DIR_OUT) == ACTION_BLOCK {
-        Ok(TC_ACT_SHOT)
-    } else {
-        Ok(TC_ACT_PIPE)
+    let key = ConnKey { local_ip, remote_ip, local_port, remote_port, protocol, direction: DIR_OUT, _padding: [0; 2] };
+    if let Some(&action) = unsafe { CONNTRACK.get(&key) } {
+        return Ok(if action == ACTION_BLOCK { TC_ACT_SHOT } else { TC_ACT_PIPE });
     }
+
+    let app_proto = detect_app_proto(data, data_end, protocol, payload_offset);
+    let action = apply_rules(remote_ip, protocol, app_proto, remote_port, DIR_OUT);
+
+    if action == ACTION_BLOCK || app_proto != 0 { let _ = CONNTRACK.insert(&key, &action, 0); }
+    Ok(if action == ACTION_BLOCK { TC_ACT_SHOT } else { TC_ACT_PIPE })
 }
 
-/// 遍历规则数组，返回第一条匹配规则的动作；无匹配则放行
 #[inline(always)]
-fn apply_rules(
-    ctx_data: (*const u8, *const u8),
-    payload_offset: usize,
-    remote_ip: u32,
-    protocol: u8,
-    port: u16,
-    direction: u8,
-) -> u8 {
+fn detect_app_proto(data: *const u8, data_end: *const u8, protocol: u8, payload_offset: usize) -> u8 {
+    if protocol != IPPROTO_TCP { return 0; }
+    if is_tls(data, data_end, payload_offset) { return PROTO_TLS; }
+    if is_http_request(data, data_end, payload_offset) { return PROTO_HTTP; }
+    if is_socks5_request(data, data_end, payload_offset) { return PROTO_SOCKS5; }
+    // FET 判断在 plain_text 之前：高熵数据优先识别为加密流量
+    if is_fet(data, data_end, payload_offset) { return PROTO_FET; }
+    0
+}
+
+#[inline(always)]
+fn apply_rules(remote_ip: u32, protocol: u8, app_proto: u8, port: u16, direction: u8) -> u8 {
     for i in 0..MAX_RULES {
-        let rule = match RULES.get(i) {
-            Some(r) => r,
-            None => continue,
-        };
-
-        if rule.enabled == 0 {
-            continue;
-        }
-        if rule.direction != direction {
-            continue;
-        }
-
-        // 协议匹配
+        let rule = match RULES.get(i) { Some(r) => r, None => break };
+        if rule.enabled == 0 { break; }
+        if rule.direction != direction { continue; }
+        // 匹配逻辑：如果规则是具体协议(HTTP/FET等)，则检查 app_proto；如果是基础协议(TCP/UDP)，则匹配 L4 协议
         if rule.protocol != PROTO_ALL {
-            if rule.protocol == PROTO_HTTP {
-                if protocol != IPPROTO_TCP || !is_http_request(ctx_data, payload_offset) {
-                    continue;
-                }
-            } else if rule.protocol == PROTO_SOCKS5 {
-                if protocol != IPPROTO_TCP || !is_socks5_request(ctx_data, payload_offset) {
-                    continue;
-                }
-            } else if rule.protocol != protocol {
-                continue;
-            }
+            if rule.protocol != protocol && rule.protocol != app_proto { continue; }
         }
-
-        // 端口匹配：port_start=0 且 port_end=0 表示所有端口
-        if rule.port_start != 0 || rule.port_end != 0 {
-            if port < rule.port_start || port > rule.port_end {
-                continue;
-            }
-        }
-
-        // IP 匹配
+        if (rule.port_start != 0 || rule.port_end != 0) && (port < rule.port_start || port > rule.port_end) { continue; }
         let ip_ok = match rule.ip_type {
             IP_TYPE_ANY => true,
             IP_TYPE_CIDR => {
-                let mask = if rule.src_prefix_len == 0 {
-                    0u32
-                } else if rule.src_prefix_len >= 32 {
-                    0xFFFF_FFFFu32
-                } else {
-                    0xFFFF_FFFFu32.wrapping_shl(32 - rule.src_prefix_len)
-                };
+                let mask = if rule.src_prefix_len == 0 { 0 } else if rule.src_prefix_len >= 32 { 0xFFFFFFFF } else { 0xFFFF_FFFFu32.wrapping_shl(32 - rule.src_prefix_len) };
                 (u32::from_be(remote_ip) & mask) == (u32::from_be(rule.src_ip) & mask)
             }
             IP_TYPE_GEOIP => {
                 let key = Key::<u32>::new(32, remote_ip);
-                match GEOIP_MAP.get(&key) {
-                    Some(&1) => true,
-                    _ => false,
-                }
+                match GEOIP_MAP.get(&key) { Some(&1) => true, _ => false }
             }
             _ => false,
         };
-
-        if !ip_ok {
-            continue;
-        }
-
-        return rule.action;
+        if ip_ok { return rule.action; }
     }
-
-    ACTION_PASS // 默认放行
+    ACTION_PASS
 }
 
-// 检测是否为 HTTP 请求
 #[inline(always)]
-fn is_http_request(ctx_data: (*const u8, *const u8), payload_offset: usize) -> bool {
-    // 尝试读取前4个字节来检测 HTTP 方法
-    let method_bytes = match ptr_at_raw::<[u8; 4]>(ctx_data, payload_offset) {
-        Ok(ptr) => unsafe { *ptr },
-        Err(_) => return false,
-    };
-
-    // 构造 u32 进行比较 (大端)
-    let method_u32 = ((method_bytes[0] as u32) << 24)
-        | ((method_bytes[1] as u32) << 16)
-        | ((method_bytes[2] as u32) << 8)
-        | (method_bytes[3] as u32);
-
-    // 检查是否匹配常见的 HTTP 方法
-    method_u32 == HTTP_GET
-        || method_u32 == HTTP_POST
-        || method_u32 == HTTP_HEAD
-        || method_u32 == HTTP_PUT
-        || method_u32 == HTTP_DELETE
-        || method_u32 == HTTP_OPTIONS
-        || method_u32 == HTTP_PATCH
-        || method_u32 == HTTP_CONNECT
+fn is_tls(data: *const u8, data_end: *const u8, payload_offset: usize) -> bool {
+    let start = data as usize + payload_offset;
+    if start + 3 > data_end as usize { return false; }
+    let p = start as *const u8;
+    unsafe { *p == 0x16 && *p.add(1) == 0x03 && *p.add(2) <= 0x03 }
 }
 
-// 检测是否为 SOCKS5 请求
 #[inline(always)]
-fn is_socks5_request(ctx_data: (*const u8, *const u8), payload_offset: usize) -> bool {
-    // 尝试读取前2个字节
-    let socks_header = match ptr_at_raw::<[u8; 2]>(ctx_data, payload_offset) {
-        Ok(ptr) => unsafe { *ptr },
-        Err(_) => return false,
-    };
-
-    // 检查版本号
-    if socks_header[0] != SOCKS5_VERSION {
-        return false;
+fn is_fet(data: *const u8, data_end: *const u8, payload_offset: usize) -> bool {
+    let start = data as usize + payload_offset;
+    if start + 16 > data_end as usize { return false; }
+    let p = start as *const u8;
+    let mut ones: u32 = 0;
+    let mut i = 0;
+    while i < 16 {
+        ones += unsafe { (*p.add(i)).count_ones() };
+        i += 1;
     }
+    ones >= 54 && ones <= 74
+}
 
-    // 检查方法数量是否合理 (1-255)
-    let nmethods = socks_header[1];
-    if nmethods == 0 {
-        return false;
+#[inline(always)]
+fn is_http_request(data: *const u8, data_end: *const u8, payload_offset: usize) -> bool {
+    let start = data as usize + payload_offset;
+    if start + 4 > data_end as usize { return false; }
+    let p = start as *const u32;
+    let m = u32::from_be(unsafe { *p });
+    m == HTTP_GET || m == HTTP_POST || m == HTTP_HEAD || m == HTTP_PUT || m == HTTP_DELETE || m == HTTP_OPTIONS || m == HTTP_PATCH || m == HTTP_CONNECT
+}
+
+#[inline(always)]
+fn is_socks5_request(data: *const u8, data_end: *const u8, payload_offset: usize) -> bool {
+    let start = data as usize + payload_offset;
+    if start + 3 > data_end as usize { return false; }
+    let p = start as *const u8;
+    unsafe {
+        let nmethods = *p.add(1);
+        // version=0x05, nmethods 在合理范围 1-8, 且包长度足以容纳 method list
+        *p == SOCKS5_VERSION
+            && nmethods >= 1
+            && nmethods <= 8
+            && start + 2 + nmethods as usize <= data_end as usize
     }
-
-    // 进一步验证：确保至少有 nmethods 字节的数据可读
-    let total_len = 2 + nmethods as usize;
-    ptr_at_raw::<u8>(ctx_data, payload_offset + total_len - 1).is_ok()
 }
 
 #[inline(always)]
-fn ptr_at_raw<T>(ctx_data: (*const u8, *const u8), offset: usize) -> Result<*const T, ()> {
-    let (start, end) = ctx_data;
-    let len = size_of::<T>();
-    if (start as usize) + offset + len > (end as usize) {
-        return Err(());
-    }
-    Ok(((start as usize) + offset) as *const T)
-}
-
-#[inline(always)]
-fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    ptr_at_raw((ctx.data() as *const u8, ctx.data_end() as *const u8), offset)
-}
-
-#[inline(always)]
-fn ptr_at_tc<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
-    ptr_at_raw((ctx.data() as *const u8, ctx.data_end() as *const u8), offset)
+fn ptr_at<T>(data: *const u8, data_end: *const u8, offset: usize) -> Result<*const T, ()> {
+    let start = data as usize + offset;
+    if start + size_of::<T>() > data_end as usize { return Err(()); }
+    Ok(start as *const T)
 }
 
 #[cfg(not(test))]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe { core::hint::unreachable_unchecked() }
-}
+fn panic(_info: &core::panic::PanicInfo) -> ! { unsafe { core::hint::unreachable_unchecked() } }
 
 #[unsafe(link_section = "license")]
 #[unsafe(no_mangle)]

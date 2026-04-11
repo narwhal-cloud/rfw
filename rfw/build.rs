@@ -1,6 +1,5 @@
 use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
-use std::env;
 
 fn main() -> anyhow::Result<()> {
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()

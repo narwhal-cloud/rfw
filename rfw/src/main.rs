@@ -14,7 +14,7 @@ use clap::Parser;
 use log::{debug, info, warn};
 use rfw_common::{
     FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, IP_TYPE_ANY, IP_TYPE_CIDR,
-    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_HTTP, PROTO_SOCKS5, PROTO_TCP, PROTO_UDP,
+    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_FET, PROTO_HTTP, PROTO_SOCKS5, PROTO_TCP, PROTO_UDP,
 };
 use std::sync::Arc;
 use tokio::signal;
@@ -110,9 +110,6 @@ impl Direction {
             Self::Out => DIR_OUT,
         }
     }
-    fn from_u8(v: u8) -> Self {
-        if v == DIR_OUT { Self::Out } else { Self::In }
-    }
     fn as_str(&self) -> &'static str {
         match self {
             Self::In => "in",
@@ -128,6 +125,7 @@ enum Protocol {
     Udp,
     Http,
     Socks5,
+    Fet,
     All,
 }
 
@@ -138,16 +136,8 @@ impl Protocol {
             Self::Udp => PROTO_UDP,
             Self::Http => PROTO_HTTP,
             Self::Socks5 => PROTO_SOCKS5,
+            Self::Fet => PROTO_FET,
             Self::All => PROTO_ALL,
-        }
-    }
-    fn from_u8(v: u8) -> Self {
-        match v {
-            PROTO_TCP => Self::Tcp,
-            PROTO_UDP => Self::Udp,
-            PROTO_HTTP => Self::Http,
-            PROTO_SOCKS5 => Self::Socks5,
-            _ => Self::All,
         }
     }
     fn as_str(&self) -> &'static str {
@@ -156,6 +146,7 @@ impl Protocol {
             Self::Udp => "udp",
             Self::Http => "http",
             Self::Socks5 => "socks5",
+            Self::Fet => "fet",
             Self::All => "all",
         }
     }
@@ -174,9 +165,6 @@ impl Action {
             Self::Block => ACTION_BLOCK,
             Self::Pass => ACTION_PASS,
         }
-    }
-    fn from_u8(v: u8) -> Self {
-        if v == ACTION_PASS { Self::Pass } else { Self::Block }
     }
     fn as_str(&self) -> &'static str {
         match self {
