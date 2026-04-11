@@ -1,19 +1,12 @@
 openapi: 3.0.3
 info:
   title: RFW 防火墙 API
-  version: 1.0.0
+  version: 2.0.0
   description: |
     # RFW - 基于 eBPF/XDP 的高性能防火墙 API 文档
 
-    一个完全API驱动的防火墙，支持实时规则配置、GeoIP 过滤、端口转发等功能。
-    所有规则修改直接作用于 eBPF maps，无需重启防火墙。
-
-    ## 核心特性
-    - ⚡ **实时更新** - 所有修改立即生效
-    - 🌍 **GeoIP 过滤** - 自动下载国家 IP 段
-    - 🔒 **黑白名单** - 灵活的访问控制模式
-    - 🚀 **高性能** - 内核级处理，微秒延迟
-    - 🔧 **细粒度控制** - 端口、协议、方向、IP 段、域名多维度组合
+    基于 Rust 和 aya 开发的高性能防火墙控制接口。
+    支持实时规则同步、GeoIP 自动化下载和 CIDR 匹配。
 
   contact:
     name: RFW 项目
@@ -24,475 +17,206 @@ info:
 servers:
   - url: http://localhost:8080
     description: 本地开发环境
-  - url: http://0.0.0.0:8080
-    description: 生产环境（默认配置）
 
 tags:
   - name: 规则管理
-    description: 端口规则的创建、更新、删除
-  - name: 端口转发
-    description: 端口转发规则的配置
-  - name: 域名过滤
-    description: SNI 域名黑名单管理
-  - name: 日志和配置
-    description: 访问日志和全局配置
-  - name: 查询接口
-    description: 获取防火墙状态和统计信息
+    description: 防火墙规则的增删改查
+  - name: 系统状态
+    description: 获取防火墙运行信息
 
 paths:
-  /api/rules/port:
-    post:
-      tags:
-        - 规则管理
-      summary: 创建或更新端口规则
-      description: |
-        创建一条新的防火墙规则或更新已有规则。
-
-        ### 规则组件
-        - **ports**: 单个端口、范围或列表（"0" 表示全局）
-        - **protocol**: 传输层（tcp/udp/any）或应用层（socks5/http/tls/quic/等）
-        - **direction**: 流量方向（inbound/outbound/both）
-        - **action**: 操作模式（block=黑名单，allow=白名单）
-        - **条件**（可选）: geoip、ip_range、domains
-
-        ### 自动 GeoIP 加载
-        指定 `geoip` 字段时，系统自动：
-        1. 从 GitHub 下载对应国家的 IP 段数据
-        2. 加载到 GEOIP_MAP (LpmTrie 结构)
-        3. 启用 RULE_GEOIP_ENABLED flag
-
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/PortRuleRequest'
-            examples:
-              block-socks5:
-                summary: 禁止 SOCKS5（黑名单）
-                value:
-                  ports: "1080"
-                  protocol: socks5
-                  action: block
-              allow-whitelist:
-                summary: 仅允许特定 IP（白名单）
-                value:
-                  ports: "8080"
-                  protocol: tcp
-                  action: allow
-                  ip_range: ["192.168.1.0/24"]
-              geoip-filter:
-                summary: 禁止来自中国的 HTTP
-                value:
-                  ports: "80,443"
-                  protocol: http
-                  direction: inbound
-                  action: block
-                  geoip: ["CN"]
-
-      responses:
-        '200':
-          description: 规则应用成功
-        '400':
-          description: 请求参数错误
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error:
-                    type: string
-        '500':
-          description: 服务器内部错误
-
-  /api/rules/port/{port}:
-    delete:
-      tags:
-        - 规则管理
-      summary: 删除端口规则
-      description: |
-        删除指定端口的所有规则（包括黑名单、白名单、传输层规则）。
-
-        使用 port=0 删除全局规则。
-      parameters:
-        - name: port
-          in: path
-          required: true
-          description: 端口号，使用 0 表示全局规则
-          schema:
-            type: integer
-            minimum: 0
-            maximum: 65535
-          example: 1080
-      responses:
-        '200':
-          description: 规则删除成功
-        '404':
-          description: 规则不存在
-        '500':
-          description: 服务器内部错误
-
-  /api/rules/forward:
-    post:
-      tags:
-        - 端口转发
-      summary: 配置端口转发
-      description: |
-        创建端口转发规则，将到达某个端口的流量转发到另一个地址。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/PortForwardRequest'
-            example:
-              dst_port: 8080
-              protocol: tcp
-              new_dst_ip: "127.0.0.1"
-              new_dst_port: 3000
-      responses:
-        '200':
-          description: 转发规则创建成功
-        '400':
-          description: 请求参数错误
-        '500':
-          description: 服务器内部错误
-
-  /api/rules/forward/{port}/{protocol}:
-    delete:
-      tags:
-        - 端口转发
-      summary: 删除端口转发规则
-      parameters:
-        - name: port
-          in: path
-          required: true
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 65535
-          example: 8080
-        - name: protocol
-          in: path
-          required: true
-          schema:
-            type: string
-            enum: [tcp, udp]
-          example: tcp
-      responses:
-        '200':
-          description: 转发规则删除成功
-        '404':
-          description: 规则不存在
-
-  /api/rules/domain/{domain}:
-    delete:
-      tags:
-        - 域名过滤
-      summary: 删除域名黑名单
-      description: 删除已添加的域名黑名单条目，停止对该域名的 SNI 拦截。
-      parameters:
-        - name: domain
-          in: path
-          required: true
-          schema:
-            type: string
-            pattern: "^[a-zA-Z0-9.-]+$"
-          example: example.com
-      responses:
-        '200':
-          description: 域名删除成功
-        '404':
-          description: 域名不在黑名单中
-
-  /api/rules/logging:
-    post:
-      tags:
-        - 日志和配置
-      summary: 启用或禁用访问日志
-      description: |
-        控制是否记录端口访问日志。启用后，所有通过/阻止的连接都会被记录。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                enabled:
-                  type: boolean
-                  description: 是否启用日志
-              example:
-                enabled: true
-      responses:
-        '200':
-          description: 日志配置更新成功
-        '500':
-          description: 服务器内部错误
-
-  /api/config/flags:
-    post:
-      tags:
-        - 日志和配置
-      summary: 设置全局配置标志
-      description: |
-        直接设置防火墙 CONFIG 标志。
-
-        **高级用户接口** - 用于 eBPF maps 的直接操作。
-        一般情况下无需使用此接口。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                flags:
-                  type: integer
-                  description: 配置标志值
-      responses:
-        '200':
-          description: 配置更新成功
-        '400':
-          description: 无效的标志值
-
   /api/status:
     get:
       tags:
-        - 查询接口
+        - 系统状态
       summary: 获取防火墙状态
-      description: 返回防火墙的当前状态，包括绑定接口、配置标志和活跃规则数。
       responses:
         '200':
-          description: 成功获取状态
+          description: 成功返回状态
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/StatusResponse'
-              example:
-                interface: eth0
-                config_flags: 256
-                active_rules: 5
 
-  /api/stats:
+  /api/rules:
     get:
       tags:
-        - 查询接口
-      summary: 获取端口访问统计
-      description: |
-        返回端口访问日志统计信息。
-
-        需要先通过 `POST /api/rules/logging` 启用日志。
+        - 规则管理
+      summary: 列出所有规则
       responses:
         '200':
-          description: 成功获取统计数据
+          description: 规则列表
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/PortAccessStat'
-              example:
-                - port: 1080
-                  protocol: 6
-                  src_ip: 192.168.1.100
-                  allowed: 10
-                  blocked: 5
+                  $ref: '#/components/schemas/RuleResponse'
+    post:
+      tags:
+        - 规则管理
+      summary: 创建新规则
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRuleRequest'
+      responses:
+        '200':
+          description: 规则创建成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+        '400':
+          description: 参数错误
+        '500':
+          description: 内部处理错误（如 GeoIP 下载失败或 eBPF 同步失败）
+
+  /api/rules/{id}:
+    delete:
+      tags:
+        - 规则管理
+      summary: 删除指定规则
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 删除成功
+        '404':
+          description: 规则不存在
 
 components:
   schemas:
-    PortRuleRequest:
+    Direction:
+      type: string
+      enum: [in, out]
+      description: 流量方向
+
+    Protocol:
+      type: string
+      enum: [tcp, udp, all]
+      description: 协议类型
+
+    Action:
+      type: string
+      enum: [block, pass]
+      description: 匹配动作
+
+    IpConfig:
+      type: object
+      oneOf:
+        - $ref: '#/components/schemas/IpConfigAny'
+        - $ref: '#/components/schemas/IpConfigCidr'
+        - $ref: '#/components/schemas/IpConfigGeoip'
+      discriminator:
+        propertyName: ip_type
+
+    IpConfigAny:
+      type: object
+      required: [ip_type]
+      properties:
+        ip_type:
+          type: string
+          enum: [any]
+
+    IpConfigCidr:
+      type: object
+      required: [ip_type, ip]
+      properties:
+        ip_type:
+          type: string
+          enum: [cidr]
+        ip:
+          type: string
+          description: CIDR 格式的 IP 段
+          example: "1.2.3.4/32"
+
+    IpConfigGeoip:
+      type: object
+      required: [ip_type, countries]
+      properties:
+        ip_type:
+          type: string
+          enum: [geoip]
+        countries:
+          type: array
+          items:
+            type: string
+          description: ISO 国家代码列表
+          example: ["CN", "US"]
+
+    CreateRuleRequest:
       type: object
       required:
-        - ports
+        - priority
+        - direction
         - protocol
+        - port_start
+        - ip_type
+        - action
       properties:
-        ports:
-          type: string
-          description: |
-            端口号或范围：
-            - "8080" - 单个端口
-            - "8000-9000" - 端口范围
-            - "80,443,8080" - 端口列表
-            - "80-100,443,8080-8090" - 混合方式
-            - "0" - 所有端口（全局规则）
-          example: "1080"
+        priority:
+          type: integer
+          description: 优先级，值越大越优先匹配
+        enabled:
+          type: boolean
+          default: true
+        direction:
+          $ref: '#/components/schemas/Direction'
         protocol:
-          type: string
-          description: |
-            协议类型：
+          $ref: '#/components/schemas/Protocol'
+        port_start:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        port_end:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: 结束端口，默认等于 port_start
+        action:
+          $ref: '#/components/schemas/Action'
+      # ip_config fields are flattened via oneOf in actual implementation
+      allOf:
+        - $ref: '#/components/schemas/IpConfig'
 
-            **传输层**: tcp, udp, any
-
-            **应用层**: socks5, http, wireguard, quic, fet_strict, fet_loose, tls, email, all
-          enum:
-            - tcp
-            - udp
-            - any
-            - socks5
-            - http
-            - wireguard
-            - quic
-            - fet_strict
-            - fet_loose
-            - tls
-            - email
-            - all
-          example: socks5
+    RuleResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        priority:
+          type: integer
+        enabled:
+          type: boolean
         direction:
           type: string
-          description: |
-            流量方向：
-            - inbound: 入站（源 IP 为外网）
-            - outbound: 出站（目标 IP 为外网）
-            - both: 双向
-          enum:
-            - inbound
-            - outbound
-            - both
-          default: inbound
-        action:
-          type: string
-          description: |
-            操作模式：
-            - block: 黑名单（阻止指定协议）
-            - allow: 白名单（仅允许指定协议）
-          enum:
-            - block
-            - allow
-          default: block
-        domains:
-          type: array
-          items:
-            type: string
-          description: SNI 域名列表（仅用于 protocol=tls）
-          example: ["example.com", "ads.example.com"]
-        geoip:
-          type: array
-          items:
-            type: string
-            pattern: "^[A-Z]{2}$"
-          description: |
-            国家代码列表（ISO 3166-1 alpha-2）。
-            指定此字段时，系统自动从 GitHub 下载对应国家的 IP 段数据。
-          example: ["CN", "RU"]
-        ip_range:
-          type: array
-          items:
-            type: string
-            pattern: "^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}/\\d{1,2}$"
-          description: CIDR 格式的 IP 段列表
-          example: ["192.168.1.0/24", "10.0.0.0/8"]
-
-    PortForwardRequest:
-      type: object
-      required:
-        - dst_port
-        - protocol
-        - new_dst_ip
-        - new_dst_port
-      properties:
-        dst_port:
-          type: integer
-          minimum: 1
-          maximum: 65535
-          description: 目标端口（要转发的端口）
-          example: 8080
         protocol:
           type: string
-          enum: [tcp, udp]
-          description: 协议类型
-          example: tcp
-        new_dst_ip:
-          type: string
-          pattern: "^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$"
-          description: 转发到的目标 IP 地址
-          example: "127.0.0.1"
-        new_dst_port:
+        port_start:
           type: integer
-          minimum: 1
-          maximum: 65535
-          description: 转发到的目标端口
-          example: 3000
+        port_end:
+          type: integer
+        action:
+          type: string
+      allOf:
+        - $ref: '#/components/schemas/IpConfig'
 
     StatusResponse:
       type: object
       properties:
-        interface:
+        iface:
           type: string
-          description: 防火墙绑定的网络接口名称
-          example: eth0
-        config_flags:
-          type: integer
-          description: 当前配置标志值
-          example: 256
-        active_rules:
-          type: integer
-          description: 活跃规则数量
-          example: 5
-
-    PortAccessStat:
-      type: object
-      properties:
-        port:
-          type: integer
-          description: 端口号
-          example: 1080
-        protocol:
-          type: integer
-          description: 协议号（6=TCP, 17=UDP）
-          example: 6
-        src_ip:
+        api_version:
           type: string
-          description: 源 IP 地址
-          example: "192.168.1.100"
-        allowed:
+        rule_count:
           type: integer
-          description: 允许通过的连接数
-          example: 10
-        blocked:
-          type: integer
-          description: 被阻止的连接数
-          example: 5
-
-  responses:
-    BadRequest:
-      description: 请求参数错误
-      content:
-        application/json:
-          schema:
-            type: object
-            properties:
-              error:
-                type: string
-
-    NotFound:
-      description: 资源不存在
-
-    InternalError:
-      description: 服务器内部错误
-
-  examples:
-    BlockSocks5:
-      summary: 禁止 SOCKS5 代理
-      value:
-        ports: "1080"
-        protocol: socks5
-        action: block
-
-    WhitelistIP:
-      summary: 白名单 IP 段
-      value:
-        ports: "443"
-        protocol: tcp
-        action: allow
-        ip_range: ["192.168.1.0/24"]
-
-    GeoIPBlock:
-      summary: GeoIP 过滤
-      value:
-        ports: "0"
-        protocol: all
-        direction: inbound
-        action: block
-        geoip: ["CN", "RU", "KP"]

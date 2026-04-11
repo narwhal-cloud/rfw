@@ -12,6 +12,22 @@ pub const PROTO_ALL: u8 = 0;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
 
+// 应用层协议（自定义编号）
+pub const PROTO_HTTP: u8 = 80;
+pub const PROTO_SOCKS5: u8 = 108;
+
+// HTTP 方法特征值 (大端序 u32)
+pub const HTTP_GET: u32 = 0x47455420;     // "GET "
+pub const HTTP_POST: u32 = 0x504F5354;    // "POST"
+pub const HTTP_HEAD: u32 = 0x48454144;    // "HEAD"
+pub const HTTP_PUT: u32 = 0x50555420;     // "PUT "
+pub const HTTP_DELETE: u32 = 0x44454C45;  // "DELE"
+pub const HTTP_OPTIONS: u32 = 0x4F505449; // "OPTI"
+pub const HTTP_PATCH: u32 = 0x50415443;   // "PATC"
+pub const HTTP_CONNECT: u32 = 0x434F4E4E; // "CONN"
+
+pub const SOCKS5_VERSION: u8 = 0x05;
+
 // 动作
 pub const ACTION_BLOCK: u8 = 0;
 pub const ACTION_PASS: u8 = 1;

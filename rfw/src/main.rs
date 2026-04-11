@@ -14,7 +14,7 @@ use clap::Parser;
 use log::{debug, info, warn};
 use rfw_common::{
     FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, IP_TYPE_ANY, IP_TYPE_CIDR,
-    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_TCP, PROTO_UDP,
+    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_HTTP, PROTO_SOCKS5, PROTO_TCP, PROTO_UDP,
 };
 use std::sync::Arc;
 use tokio::signal;
@@ -94,21 +94,127 @@ fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
     Some((ip & mask, prefix_len))
 }
 
+// ========== API Types & Enums ==========
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Direction {
+    In,
+    Out,
+}
+
+impl Direction {
+    fn to_u8(&self) -> u8 {
+        match self {
+            Self::In => DIR_IN,
+            Self::Out => DIR_OUT,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        if v == DIR_OUT { Self::Out } else { Self::In }
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Protocol {
+    Tcp,
+    Udp,
+    Http,
+    Socks5,
+    All,
+}
+
+impl Protocol {
+    fn to_u8(&self) -> u8 {
+        match self {
+            Self::Tcp => PROTO_TCP,
+            Self::Udp => PROTO_UDP,
+            Self::Http => PROTO_HTTP,
+            Self::Socks5 => PROTO_SOCKS5,
+            Self::All => PROTO_ALL,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            PROTO_TCP => Self::Tcp,
+            PROTO_UDP => Self::Udp,
+            PROTO_HTTP => Self::Http,
+            PROTO_SOCKS5 => Self::Socks5,
+            _ => Self::All,
+        }
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Http => "http",
+            Self::Socks5 => "socks5",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Action {
+    Block,
+    Pass,
+}
+
+impl Action {
+    fn to_u8(&self) -> u8 {
+        match self {
+            Self::Block => ACTION_BLOCK,
+            Self::Pass => ACTION_PASS,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        if v == ACTION_PASS { Self::Pass } else { Self::Block }
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Pass => "pass",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(tag = "ip_type", rename_all = "lowercase")]
+enum IpConfig {
+    Any,
+    Cidr { ip: String },
+    Geoip { countries: Vec<String> },
+}
+
 // ========== 状态 ==========
 
-#[derive(Clone)]
 struct RuleEntry {
     id: u64,
     rule: FirewallRule,
-    // 仅用于展示/响应
-    direction_str: String,
-    protocol_str: String,
-    ip_type_str: String,
-    action_str: String,
-    cidr: Option<String>,
-    countries: Vec<String>,
-    // GeoIP 规则缓存的 CIDR 列表（用于重建 GEOIP_MAP）
+    // 原始配置信息，用于展示和重建缓存
+    config: RuleConfig,
+    // GeoIP 规则缓存的 CIDR 列表
     cached_cidrs: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RuleConfig {
+    priority: u32,
+    enabled: bool,
+    direction: Direction,
+    protocol: Protocol,
+    port_start: u16,
+    port_end: u16,
+    ip_config: IpConfig,
+    action: Action,
 }
 
 struct RulesState {
@@ -126,8 +232,12 @@ struct AppState {
 // ========== eBPF 同步 ==========
 
 fn sync_rules(ebpf: &mut Ebpf, entries: &[RuleEntry]) -> anyhow::Result<()> {
-    let mut sorted: Vec<&RuleEntry> = entries.iter().collect();
-    sorted.sort_by(|a, b| b.rule.priority.cmp(&a.rule.priority));
+    // 仅选择已启用的规则，并按优先级降序排列
+    let mut active_entries: Vec<&RuleEntry> = entries
+        .iter()
+        .filter(|e| e.config.enabled)
+        .collect();
+    active_entries.sort_by(|a, b| b.config.priority.cmp(&a.config.priority));
 
     let empty = FirewallRule {
         priority: 0,
@@ -149,12 +259,21 @@ fn sync_rules(ebpf: &mut Ebpf, entries: &[RuleEntry]) -> anyhow::Result<()> {
         .try_into()?;
 
     for i in 0..MAX_RULES as usize {
-        let rule = sorted.get(i).map(|e| e.rule).unwrap_or(empty);
+        let rule = active_entries.get(i).map(|e| e.rule).unwrap_or(empty);
         rules_map.set(i as u32, rule, 0)?;
+    }
+
+    if active_entries.len() > MAX_RULES as usize {
+        warn!(
+            "活动规则数量 ({}) 超过了最大限制 ({})，超出部分将被忽略",
+            active_entries.len(),
+            MAX_RULES
+        );
     }
 
     Ok(())
 }
+
 
 fn update_geoip(ebpf: &mut Ebpf, entries: &[RuleEntry]) -> anyhow::Result<()> {
     let mut geoip_map: LpmTrie<_, u32, u8> = ebpf
@@ -184,14 +303,13 @@ struct CreateRuleRequest {
     priority: u32,
     #[serde(default = "bool_true")]
     enabled: bool,
-    direction: String,           // "in" | "out"
-    protocol: String,            // "tcp" | "udp" | "all"
-    port_start: u16,             // 0 = 所有端口
-    port_end: Option<u16>,       // 默认等于 port_start
-    ip_type: String,             // "any" | "cidr" | "geoip"
-    ip: Option<String>,          // CIDR，ip_type="cidr" 时必填
-    countries: Option<Vec<String>>, // 国家代码，ip_type="geoip" 时必填
-    action: String,              // "block" | "pass"
+    direction: Direction,
+    protocol: Protocol,
+    port_start: u16,
+    port_end: Option<u16>,
+    #[serde(flatten)]
+    ip_config: IpConfig,
+    action: Action,
 }
 
 fn bool_true() -> bool {
@@ -203,37 +321,31 @@ struct RuleResponse {
     id: u64,
     priority: u32,
     enabled: bool,
-    direction: String,
-    protocol: String,
+    direction: &'static str,
+    protocol: &'static str,
     port_start: u16,
     port_end: u16,
-    ip_type: String,
-    ip: Option<String>,
-    countries: Option<Vec<String>>,
-    action: String,
+    #[serde(flatten)]
+    ip_config: IpConfig,
+    action: &'static str,
 }
 
 impl From<&RuleEntry> for RuleResponse {
     fn from(e: &RuleEntry) -> Self {
         RuleResponse {
             id: e.id,
-            priority: e.rule.priority,
-            enabled: e.rule.enabled != 0,
-            direction: e.direction_str.clone(),
-            protocol: e.protocol_str.clone(),
-            port_start: e.rule.port_start,
-            port_end: e.rule.port_end,
-            ip_type: e.ip_type_str.clone(),
-            ip: e.cidr.clone(),
-            countries: if e.countries.is_empty() {
-                None
-            } else {
-                Some(e.countries.clone())
-            },
-            action: e.action_str.clone(),
+            priority: e.config.priority,
+            enabled: e.config.enabled,
+            direction: e.config.direction.as_str(),
+            protocol: e.config.protocol.as_str(),
+            port_start: e.config.port_start,
+            port_end: e.config.port_end,
+            ip_config: e.config.ip_config.clone(),
+            action: e.config.action.as_str(),
         }
     }
 }
+
 
 #[derive(serde::Serialize)]
 struct StatusResponse {
@@ -264,105 +376,50 @@ async fn create_rule(
     State(state): State<AppState>,
     Json(req): Json<CreateRuleRequest>,
 ) -> impl IntoResponse {
-    // 解析方向
-    let direction = match req.direction.to_lowercase().as_str() {
-        "in" | "inbound" => DIR_IN,
-        "out" | "outbound" => DIR_OUT,
-        _ => {
-            return (StatusCode::BAD_REQUEST, "direction must be 'in' or 'out'").into_response()
-        }
-    };
-
-    // 解析协议
-    let protocol = match req.protocol.to_lowercase().as_str() {
-        "tcp" => PROTO_TCP,
-        "udp" => PROTO_UDP,
-        "all" => PROTO_ALL,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "protocol must be 'tcp', 'udp', or 'all'",
-            )
-                .into_response()
-        }
-    };
-
-    // 解析动作
-    let action = match req.action.to_lowercase().as_str() {
-        "block" => ACTION_BLOCK,
-        "pass" | "allow" => ACTION_PASS,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "action must be 'block' or 'pass'",
-            )
-                .into_response()
-        }
-    };
-
     let port_start = req.port_start;
     let port_end = req.port_end.unwrap_or(port_start);
 
-    // 解析 IP 类型，获取 GeoIP 数据（在加锁前异步获取）
-    let ip_type_str = req.ip_type.to_lowercase();
-    let ip_type = match ip_type_str.as_str() {
-        "any" => IP_TYPE_ANY,
-        "cidr" => IP_TYPE_CIDR,
-        "geoip" | "geo" => IP_TYPE_GEOIP,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "ip_type must be 'any', 'cidr', or 'geoip'",
-            )
-                .into_response()
-        }
-    };
-
-    let (src_ip, src_prefix_len, cidr_str, countries, cached_cidrs) = match ip_type {
-        IP_TYPE_ANY => (0u32, 0u32, None, vec![], vec![]),
-        IP_TYPE_CIDR => {
-            let cidr = match req.ip {
-                Some(ref s) => s.clone(),
-                None => {
-                    return (StatusCode::BAD_REQUEST, "ip is required for ip_type='cidr'")
-                        .into_response()
-                }
-            };
-            let (ip_host, prefix_len) = match parse_cidr(&cidr) {
+    // 解析 IP 类型并获取必要数据
+    let (ip_type, src_ip, src_prefix_len, cached_cidrs) = match &req.ip_config {
+        IpConfig::Any => (IP_TYPE_ANY, 0u32, 0u32, vec![]),
+        IpConfig::Cidr { ip } => {
+            let (ip_host, prefix_len) = match parse_cidr(ip) {
                 Some(x) => x,
                 None => return (StatusCode::BAD_REQUEST, "Invalid CIDR format").into_response(),
             };
-            (ip_host.to_be(), prefix_len, Some(cidr), vec![], vec![])
+            (IP_TYPE_CIDR, ip_host.to_be(), prefix_len, vec![])
         }
-        IP_TYPE_GEOIP => {
-            let codes = match req.countries {
-                Some(ref c) if !c.is_empty() => c.clone(),
-                _ => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        "countries is required for ip_type='geoip'",
-                    )
-                        .into_response()
-                }
-            };
-            // 在加锁前异步下载 GeoIP 数据
-            let cidrs = match fetch_multiple_geoip(&codes).await {
+        IpConfig::Geoip { countries } => {
+            if countries.is_empty() {
+                return (StatusCode::BAD_REQUEST, "countries list cannot be empty").into_response();
+            }
+            let cidrs = match fetch_multiple_geoip(countries).await {
                 Ok(c) => c,
                 Err(e) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
                 }
             };
-            (0u32, 0u32, None, codes, cidrs)
+            (IP_TYPE_GEOIP, 0u32, 0u32, cidrs)
         }
-        _ => unreachable!(),
+    };
+
+    let config = RuleConfig {
+        priority: req.priority,
+        enabled: req.enabled,
+        direction: req.direction,
+        protocol: req.protocol,
+        port_start,
+        port_end,
+        ip_config: req.ip_config.clone(),
+        action: req.action,
     };
 
     let rule = FirewallRule {
-        priority: req.priority,
-        enabled: if req.enabled { 1 } else { 0 },
-        direction,
-        protocol,
-        action,
+        priority: config.priority,
+        enabled: if config.enabled { 1 } else { 0 },
+        direction: config.direction.to_u8(),
+        protocol: config.protocol.to_u8(),
+        action: config.action.to_u8(),
         port_start,
         port_end,
         ip_type,
@@ -371,15 +428,6 @@ async fn create_rule(
         src_prefix_len,
     };
 
-    let direction_str = if direction == DIR_IN { "in" } else { "out" }.to_string();
-    let protocol_str = match protocol {
-        PROTO_TCP => "tcp",
-        PROTO_UDP => "udp",
-        _ => "all",
-    }
-    .to_string();
-    let action_str = if action == ACTION_BLOCK { "block" } else { "pass" }.to_string();
-
     let mut rules_guard = state.rules.lock().await;
     rules_guard.next_id += 1;
     let id = rules_guard.next_id;
@@ -387,12 +435,7 @@ async fn create_rule(
     rules_guard.entries.push(RuleEntry {
         id,
         rule,
-        direction_str,
-        protocol_str,
-        ip_type_str,
-        action_str,
-        cidr: cidr_str,
-        countries,
+        config,
         cached_cidrs,
     });
 
@@ -410,9 +453,12 @@ async fn create_rule(
 
     info!("规则已创建: id={} priority={}", id, req.priority);
     #[derive(serde::Serialize)]
-    struct Resp { id: u64 }
+    struct Resp {
+        id: u64,
+    }
     Json(Resp { id }).into_response()
 }
+
 
 async fn delete_rule(
     State(state): State<AppState>,

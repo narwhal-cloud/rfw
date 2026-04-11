@@ -9,8 +9,9 @@ use aya_ebpf::{
 };
 use core::mem::size_of;
 use rfw_common::{
-    FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, IP_TYPE_ANY, IP_TYPE_CIDR,
-    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL,
+    FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, HTTP_CONNECT, HTTP_DELETE, HTTP_GET,
+    HTTP_HEAD, HTTP_OPTIONS, HTTP_PATCH, HTTP_POST, HTTP_PUT, IP_TYPE_ANY, IP_TYPE_CIDR,
+    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_HTTP, PROTO_SOCKS5, SOCKS5_VERSION,
 };
 
 // 防火墙规则数组（按优先级降序排列，index=0 为最高优先级）
@@ -98,19 +99,23 @@ fn try_rfw(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
+    let mut payload_offset = size_of::<EthHdr>() + ihl;
     let port = match protocol {
         IPPROTO_TCP => {
-            let tcp = ptr_at::<TcpHdr>(ctx, size_of::<EthHdr>() + ihl)?;
+            let tcp = ptr_at::<TcpHdr>(ctx, payload_offset)?;
+            payload_offset += (u16::from_be(unsafe { (*tcp)._bitfield }) >> 12) as usize * 4;
             u16::from_be(unsafe { (*tcp).dest })
         }
         IPPROTO_UDP => {
-            let udp = ptr_at::<UdpHdr>(ctx, size_of::<EthHdr>() + ihl)?;
+            let udp = ptr_at::<UdpHdr>(ctx, payload_offset)?;
+            payload_offset += size_of::<UdpHdr>();
             u16::from_be(unsafe { (*udp).dest })
         }
         _ => 0,
     };
 
-    if apply_rules(remote_ip, protocol, port, DIR_IN) == ACTION_BLOCK {
+    let ctx_data = (ctx.data() as *const u8, ctx.data_end() as *const u8);
+    if apply_rules(ctx_data, payload_offset, remote_ip, protocol, port, DIR_IN) == ACTION_BLOCK {
         Ok(xdp_action::XDP_DROP)
     } else {
         Ok(xdp_action::XDP_PASS)
@@ -131,19 +136,23 @@ fn try_rfw_egress(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_PIPE);
     }
 
+    let mut payload_offset = size_of::<EthHdr>() + ihl;
     let port = match protocol {
         IPPROTO_TCP => {
-            let tcp = ptr_at_tc::<TcpHdr>(ctx, size_of::<EthHdr>() + ihl)?;
+            let tcp = ptr_at_tc::<TcpHdr>(ctx, payload_offset)?;
+            payload_offset += (u16::from_be(unsafe { (*tcp)._bitfield }) >> 12) as usize * 4;
             u16::from_be(unsafe { (*tcp).dest })
         }
         IPPROTO_UDP => {
-            let udp = ptr_at_tc::<UdpHdr>(ctx, size_of::<EthHdr>() + ihl)?;
+            let udp = ptr_at_tc::<UdpHdr>(ctx, payload_offset)?;
+            payload_offset += size_of::<UdpHdr>();
             u16::from_be(unsafe { (*udp).dest })
         }
         _ => 0,
     };
 
-    if apply_rules(remote_ip, protocol, port, DIR_OUT) == ACTION_BLOCK {
+    let ctx_data = (ctx.data() as *const u8, ctx.data_end() as *const u8);
+    if apply_rules(ctx_data, payload_offset, remote_ip, protocol, port, DIR_OUT) == ACTION_BLOCK {
         Ok(TC_ACT_SHOT)
     } else {
         Ok(TC_ACT_PIPE)
@@ -152,7 +161,14 @@ fn try_rfw_egress(ctx: &TcContext) -> Result<i32, ()> {
 
 /// 遍历规则数组，返回第一条匹配规则的动作；无匹配则放行
 #[inline(always)]
-fn apply_rules(remote_ip: u32, protocol: u8, port: u16, direction: u8) -> u8 {
+fn apply_rules(
+    ctx_data: (*const u8, *const u8),
+    payload_offset: usize,
+    remote_ip: u32,
+    protocol: u8,
+    port: u16,
+    direction: u8,
+) -> u8 {
     for i in 0..MAX_RULES {
         let rule = match RULES.get(i) {
             Some(r) => r,
@@ -166,9 +182,19 @@ fn apply_rules(remote_ip: u32, protocol: u8, port: u16, direction: u8) -> u8 {
             continue;
         }
 
-        // 协议匹配：PROTO_ALL 匹配任意协议
-        if rule.protocol != PROTO_ALL && rule.protocol != protocol {
-            continue;
+        // 协议匹配
+        if rule.protocol != PROTO_ALL {
+            if rule.protocol == PROTO_HTTP {
+                if protocol != IPPROTO_TCP || !is_http_request(ctx_data, payload_offset) {
+                    continue;
+                }
+            } else if rule.protocol == PROTO_SOCKS5 {
+                if protocol != IPPROTO_TCP || !is_socks5_request(ctx_data, payload_offset) {
+                    continue;
+                }
+            } else if rule.protocol != protocol {
+                continue;
+            }
         }
 
         // 端口匹配：port_start=0 且 port_end=0 表示所有端口
@@ -211,26 +237,75 @@ fn apply_rules(remote_ip: u32, protocol: u8, port: u16, direction: u8) -> u8 {
     ACTION_PASS // 默认放行
 }
 
+// 检测是否为 HTTP 请求
 #[inline(always)]
-fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
+fn is_http_request(ctx_data: (*const u8, *const u8), payload_offset: usize) -> bool {
+    // 尝试读取前4个字节来检测 HTTP 方法
+    let method_bytes = match ptr_at_raw::<[u8; 4]>(ctx_data, payload_offset) {
+        Ok(ptr) => unsafe { *ptr },
+        Err(_) => return false,
+    };
+
+    // 构造 u32 进行比较 (大端)
+    let method_u32 = ((method_bytes[0] as u32) << 24)
+        | ((method_bytes[1] as u32) << 16)
+        | ((method_bytes[2] as u32) << 8)
+        | (method_bytes[3] as u32);
+
+    // 检查是否匹配常见的 HTTP 方法
+    method_u32 == HTTP_GET
+        || method_u32 == HTTP_POST
+        || method_u32 == HTTP_HEAD
+        || method_u32 == HTTP_PUT
+        || method_u32 == HTTP_DELETE
+        || method_u32 == HTTP_OPTIONS
+        || method_u32 == HTTP_PATCH
+        || method_u32 == HTTP_CONNECT
+}
+
+// 检测是否为 SOCKS5 请求
+#[inline(always)]
+fn is_socks5_request(ctx_data: (*const u8, *const u8), payload_offset: usize) -> bool {
+    // 尝试读取前2个字节
+    let socks_header = match ptr_at_raw::<[u8; 2]>(ctx_data, payload_offset) {
+        Ok(ptr) => unsafe { *ptr },
+        Err(_) => return false,
+    };
+
+    // 检查版本号
+    if socks_header[0] != SOCKS5_VERSION {
+        return false;
+    }
+
+    // 检查方法数量是否合理 (1-255)
+    let nmethods = socks_header[1];
+    if nmethods == 0 {
+        return false;
+    }
+
+    // 进一步验证：确保至少有 nmethods 字节的数据可读
+    let total_len = 2 + nmethods as usize;
+    ptr_at_raw::<u8>(ctx_data, payload_offset + total_len - 1).is_ok()
+}
+
+#[inline(always)]
+fn ptr_at_raw<T>(ctx_data: (*const u8, *const u8), offset: usize) -> Result<*const T, ()> {
+    let (start, end) = ctx_data;
     let len = size_of::<T>();
-    if start + offset + len > end {
+    if (start as usize) + offset + len > (end as usize) {
         return Err(());
     }
-    Ok((start + offset) as *const T)
+    Ok(((start as usize) + offset) as *const T)
+}
+
+#[inline(always)]
+fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+    ptr_at_raw((ctx.data() as *const u8, ctx.data_end() as *const u8), offset)
 }
 
 #[inline(always)]
 fn ptr_at_tc<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
-    let len = size_of::<T>();
-    if start + offset + len > end {
-        return Err(());
-    }
-    Ok((start + offset) as *const T)
+    ptr_at_raw((ctx.data() as *const u8, ctx.data_end() as *const u8), offset)
 }
 
 #[cfg(not(test))]
