@@ -1,134 +1,53 @@
 #![no_std]
 
-/// 防火墙规则配置的位标志
+/// 最多支持的规则数量
+pub const MAX_RULES: u32 = 64;
+
+// 方向
+pub const DIR_IN: u8 = 0;
+pub const DIR_OUT: u8 = 1;
+
+// 协议
+pub const PROTO_ALL: u8 = 0;
+pub const PROTO_TCP: u8 = 6;
+pub const PROTO_UDP: u8 = 17;
+
+// 动作
+pub const ACTION_BLOCK: u8 = 0;
+pub const ACTION_PASS: u8 = 1;
+
+// IP 匹配类型
+pub const IP_TYPE_ANY: u8 = 0;   // 匹配所有 IP
+pub const IP_TYPE_CIDR: u8 = 1;  // 匹配指定 CIDR
+pub const IP_TYPE_GEOIP: u8 = 2; // 匹配 GEOIP_MAP 中的 IP
+
+/// 防火墙规则（存储在 eBPF Array 中）
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct FirewallConfig {
-    pub flags: u32,
+pub struct FirewallRule {
+    pub priority: u32,       // 优先级，越大越高
+    pub enabled: u8,         // 0=禁用, 1=启用
+    pub direction: u8,       // DIR_IN / DIR_OUT
+    pub protocol: u8,        // PROTO_ALL / PROTO_TCP / PROTO_UDP
+    pub action: u8,          // ACTION_BLOCK / ACTION_PASS
+    pub port_start: u16,     // 端口范围起始，0 表示所有端口
+    pub port_end: u16,       // 端口范围结束，与 port_start 相同则为单端口
+    pub ip_type: u8,         // IP_TYPE_ANY / IP_TYPE_CIDR / IP_TYPE_GEOIP
+    pub _padding: [u8; 3],
+    pub src_ip: u32,         // 对端 IP（入站=源IP，出站=目标IP），网络字节序
+    pub src_prefix_len: u32, // 前缀长度 (0-32)，ip_type=CIDR 时有效
 }
 
-// 规则标志位
-pub const RULE_BLOCK_EMAIL: u32 = 1 << 0; // 屏蔽发送 email
-pub const RULE_BLOCK_HTTP: u32 = 1 << 1; // 屏蔽 HTTP 入站(配合 GeoIP 或全局)
-pub const RULE_BLOCK_SOCKS5: u32 = 1 << 2; // 屏蔽 SOCKS5 入站(配合 GeoIP 或全局)
-pub const RULE_BLOCK_FET_STRICT: u32 = 1 << 3; // 屏蔽全加密流量入站 (严格模式，默认阻止)
-pub const RULE_BLOCK_WIREGUARD: u32 = 1 << 4; // 屏蔽 WireGuard 入站(配合 GeoIP 或全局)
-pub const RULE_BLOCK_ALL: u32 = 1 << 5; // 屏蔽所有入站流量(配合 GeoIP 或全局)
-pub const RULE_BLOCK_FET_LOOSE: u32 = 1 << 6; // 屏蔽全加密流量入站 (宽松模式，默认放过)
-pub const RULE_BLOCK_QUIC: u32 = 1 << 7; // 屏蔽 QUIC 入站(配合 GeoIP 或全局)
-
-// GeoIP 过滤模式
-pub const RULE_GEOIP_ENABLED: u32 = 1 << 8; // 启用 GeoIP 国家过滤
-pub const RULE_GEOIP_WHITELIST: u32 = 1 << 9; // GeoIP 白名单模式(只允许列表中的国家)
-pub const RULE_LOG_PORT_ACCESS: u32 = 1 << 10; // 记录端口访问日志
-
-// 新增规则
-pub const RULE_BLOCK_EGRESS: u32 = 1 << 11; // 启用出站流量过滤 (TC)
-pub const RULE_PORT_FORWARD: u32 = 1 << 12; // 启用端口转发 (DNAT)
-pub const RULE_BLOCK_SNI: u32 = 1 << 13; // 启用域名封禁 (SNI)
-
-impl FirewallConfig {
-    pub fn new() -> Self {
-        Self { flags: 0 }
-    }
-
-    pub fn enable_rule(&mut self, rule: u32) {
-        self.flags |= rule;
-    }
-
-    pub fn has_rule(&self, rule: u32) -> bool {
-        (self.flags & rule) != 0
-    }
-}
-
-impl Default for FirewallConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// GeoIP 条目 - IP 地址范围及国家代码
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct GeoIpEntry {
-    pub start_ip: u32,     // 起始 IP (网络字节序)
-    pub end_ip: u32,       // 结束 IP (网络字节序)
-    pub country_code: u16, // 国家代码(两字母 ISO 3166-1 alpha-2,如 CN=0x434E, US=0x5553)
-    pub _padding: u16,     // 对齐填充
-}
-
-// 为 GeoIpEntry 实现 Pod trait，使其可以在 eBPF map 中使用
 #[cfg(feature = "user")]
-unsafe impl aya::Pod for GeoIpEntry {}
+unsafe impl aya::Pod for FirewallRule {}
 
-/// LpmTrie Key 结构 - 用于 IP 前缀匹配
+/// LpmTrie Key 结构 - 用于 GeoIP 前缀匹配
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LpmTrieKey {
-    pub prefix_len: u32, // 前缀长度（位数）
-    pub data: u32,       // IP 地址（网络字节序）
+    pub prefix_len: u32,
+    pub data: u32,
 }
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LpmTrieKey {}
-
-/// 端口访问记录的 Key
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PortAccessKey {
-    pub dst_port: u16,
-    pub protocol: u8,
-    pub _padding: u8,
-    pub src_ip: u32,
-}
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for PortAccessKey {}
-
-/// 端口访问统计信息
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PortAccessStats {
-    pub allowed_count: u64, // 允许通过的次数
-    pub blocked_count: u64, // 被阻断的次数
-    pub last_seen: u64,     // 最后访问时间（保留，暂时未使用）
-}
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for PortAccessStats {}
-
-/// 端口转发 Key
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PortForwardKey {
-    pub dst_port: u16,
-    pub protocol: u8,
-    pub _padding: u8,
-}
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for PortForwardKey {}
-
-/// 端口转发 Value
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PortForwardValue {
-    pub new_dst_ip: u32,
-    pub new_dst_port: u16,
-    pub _padding: [u8; 2],
-}
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for PortForwardValue {}
-
-/// 端口封禁 Key
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PortBlockKey {
-    pub port: u16,
-    pub protocol: u8,
-    pub direction: u8, // 0 = Inbound, 1 = Outbound, 2 = Both
-}
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for PortBlockKey {}
