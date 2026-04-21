@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RFW 防火墙控制台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0d1117; color: #c9d1d9; min-height: 100vh; }
+  a { color: #58a6ff; }
+
+  .header { background: #161b22; border-bottom: 1px solid #30363d; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 18px; font-weight: 600; color: #f0f6fc; }
+  .badge { background: #238636; color: #fff; font-size: 11px; padding: 2px 8px; border-radius: 12px; }
+
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+
+  .status-bar { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  .stat { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; flex: 1; min-width: 160px; }
+  .stat-label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+  .stat-value { font-size: 22px; font-weight: 700; color: #f0f6fc; }
+  .stat-value.green { color: #3fb950; }
+
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 24px; overflow: hidden; }
+  .card-header { padding: 14px 20px; border-bottom: 1px solid #30363d; font-size: 13px; font-weight: 600; color: #f0f6fc; display: flex; align-items: center; justify-content: space-between; }
+  .card-body { padding: 20px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 8px 12px; color: #8b949e; font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid #30363d; }
+  td { padding: 10px 12px; border-bottom: 1px solid #21262d; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #1c2128; }
+
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .tag-in { background: #1f3a5c; color: #79c0ff; }
+  .tag-out { background: #3d2b0a; color: #e3b341; }
+  .tag-block { background: #4a1a1a; color: #f85149; }
+  .tag-pass { background: #1a3a2a; color: #3fb950; }
+  .tag-proto { background: #2d2d4e; color: #a5a0ff; }
+  .tag-enabled { background: #1a3a2a; color: #3fb950; }
+  .tag-disabled { background: #2d2d2d; color: #8b949e; }
+
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; border: 1px solid; cursor: pointer; transition: opacity .15s; font-family: inherit; }
+  .btn:hover { opacity: .8; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-danger { background: #4a1a1a; color: #f85149; border-color: #f85149; }
+  .btn-primary { background: #238636; color: #fff; border-color: #2ea043; }
+  .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; }
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+  .form-group.full { grid-column: 1 / -1; }
+  label { font-size: 12px; color: #8b949e; font-weight: 500; }
+  input, select { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; padding: 8px 10px; font-size: 13px; font-family: inherit; outline: none; width: 100%; }
+  input:focus, select:focus { border-color: #58a6ff; }
+  input[type=number] { -moz-appearance: textfield; }
+
+  #ip-cidr, #ip-geoip { display: none; }
+
+  .form-actions { margin-top: 18px; display: flex; align-items: center; gap: 12px; }
+  .msg { font-size: 13px; padding: 4px 0; }
+  .msg.ok { color: #3fb950; }
+  .msg.err { color: #f85149; }
+
+  .empty { text-align: center; color: #8b949e; padding: 32px; font-size: 13px; }
+
+  .refresh-btn { background: none; border: 1px solid #30363d; color: #8b949e; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .refresh-btn:hover { border-color: #58a6ff; color: #58a6ff; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3fb950" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+  <h1>RFW 防火墙控制台</h1>
+  <span class="badge" id="version-badge">v—</span>
+</div>
+
+<div class="container">
+
+  <div class="status-bar">
+    <div class="stat">
+      <div class="stat-label">网络接口</div>
+      <div class="stat-value" id="stat-iface">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">规则数量</div>
+      <div class="stat-value green" id="stat-rules">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">API 版本</div>
+      <div class="stat-value" id="stat-version">—</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      规则列表
+      <button class="refresh-btn" onclick="loadRules()">↺ 刷新</button>
+    </div>
+    <div id="rules-container">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>优先级</th><th>启用</th><th>方向</th><th>协议</th>
+            <th>端口</th><th>IP 范围</th><th>动作</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="rules-body">
+          <tr><td colspan="9" class="empty">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">创建新规则</div>
+    <div class="card-body">
+      <form id="create-form" onsubmit="createRule(event)">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>优先级</label>
+            <input type="number" name="priority" value="100" min="0" required>
+          </div>
+          <div class="form-group">
+            <label>方向</label>
+            <select name="direction">
+              <option value="in">in — 入站</option>
+              <option value="out">out — 出站</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>协议</label>
+            <select name="protocol">
+              <option value="all">all — 所有</option>
+              <option value="tcp">tcp</option>
+              <option value="udp">udp</option>
+              <option value="http">http</option>
+              <option value="socks5">socks5</option>
+              <option value="fet">fet — 加密流量</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>动作</label>
+            <select name="action">
+              <option value="block">block — 拦截</option>
+              <option value="pass">pass — 放行</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>起始端口</label>
+            <input type="number" name="port_start" value="0" min="0" max="65535" required>
+          </div>
+          <div class="form-group">
+            <label>结束端口（留空=同起始）</label>
+            <input type="number" name="port_end" min="0" max="65535" placeholder="可选">
+          </div>
+          <div class="form-group">
+            <label>启用</label>
+            <select name="enabled">
+              <option value="true">是</option>
+              <option value="false">否</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>IP 类型</label>
+            <select name="ip_type" onchange="onIpTypeChange(this.value)">
+              <option value="any">any — 任意</option>
+              <option value="cidr">cidr — 指定网段</option>
+              <option value="geoip">geoip — 按国家</option>
+            </select>
+          </div>
+          <div class="form-group" id="ip-cidr">
+            <label>CIDR</label>
+            <input type="text" name="ip" placeholder="如 1.2.3.4/32">
+          </div>
+          <div class="form-group" id="ip-geoip">
+            <label>国家代码（逗号分隔）</label>
+            <input type="text" name="countries" placeholder="如 CN,US,RU">
+          </div>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary" id="submit-btn">+ 创建规则</button>
+          <span class="msg" id="form-msg"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const BASE = '';
+
+async function loadStatus() {
+  try {
+    const r = await fetch(BASE + '/api/status');
+    const d = await r.json();
+    document.getElementById('stat-iface').textContent = d.iface;
+    document.getElementById('stat-rules').textContent = d.rule_count;
+    document.getElementById('stat-version').textContent = d.api_version;
+    document.getElementById('version-badge').textContent = 'v' + d.api_version;
+  } catch(e) {
+    document.getElementById('stat-iface').textContent = '离线';
+  }
+}
+
+function ipCell(rule) {
+  if (rule.ip_type === 'any') return '<span style="color:#8b949e">any</span>';
+  if (rule.ip_type === 'cidr') return '<code>' + esc(rule.ip) + '</code>';
+  if (rule.ip_type === 'geoip') {
+    return (rule.countries || []).map(c =>
+      '<span class="tag tag-proto">' + esc(c) + '</span>'
+    ).join(' ');
+  }
+  return '—';
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function loadRules() {
+  const tbody = document.getElementById('rules-body');
+  tbody.innerHTML = '<tr><td colspan="9" class="empty">加载中…</td></tr>';
+  try {
+    const r = await fetch(BASE + '/api/rules');
+    const rules = await r.json();
+    if (!rules.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">暂无规则</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rules.map(rule => `
+      <tr>
+        <td><code>${rule.id}</code></td>
+        <td>${rule.priority}</td>
+        <td><span class="tag ${rule.enabled ? 'tag-enabled' : 'tag-disabled'}">${rule.enabled ? '启用' : '停用'}</span></td>
+        <td><span class="tag ${rule.direction==='in'?'tag-in':'tag-out'}">${esc(rule.direction)}</span></td>
+        <td><span class="tag tag-proto">${esc(rule.protocol)}</span></td>
+        <td>${rule.port_start === rule.port_end ? rule.port_start : rule.port_start + '–' + rule.port_end}</td>
+        <td>${ipCell(rule)}</td>
+        <td><span class="tag ${rule.action==='block'?'tag-block':'tag-pass'}">${esc(rule.action)}</span></td>
+        <td><button class="btn btn-danger btn-sm" onclick="deleteRule(${rule.id}, this)">删除</button></td>
+      </tr>
+    `).join('');
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty" style="color:#f85149">加载失败: ' + esc(e.message) + '</td></tr>';
+  }
+  loadStatus();
+}
+
+async function deleteRule(id, btn) {
+  if (!confirm('确认删除规则 #' + id + '？')) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(BASE + '/api/rules/' + id, { method: 'DELETE' });
+    if (r.ok) loadRules();
+    else btn.disabled = false;
+  } catch(e) {
+    btn.disabled = false;
+  }
+}
+
+async function createRule(e) {
+  e.preventDefault();
+  const form = e.target;
+  const msg = document.getElementById('form-msg');
+  const btn = document.getElementById('submit-btn');
+  const fd = new FormData(form);
+
+  const body = {
+    priority: parseInt(fd.get('priority')),
+    direction: fd.get('direction'),
+    protocol: fd.get('protocol'),
+    action: fd.get('action'),
+    port_start: parseInt(fd.get('port_start')),
+    enabled: fd.get('enabled') === 'true',
+    ip_type: fd.get('ip_type'),
+  };
+
+  const portEnd = fd.get('port_end');
+  if (portEnd !== '') body.port_end = parseInt(portEnd);
+
+  if (body.ip_type === 'cidr') {
+    body.ip = fd.get('ip');
+  } else if (body.ip_type === 'geoip') {
+    body.countries = fd.get('countries').split(',').map(s => s.trim()).filter(Boolean);
+  }
+
+  btn.disabled = true;
+  msg.textContent = '';
+  msg.className = 'msg';
+
+  try {
+    const r = await fetch(BASE + '/api/rules', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (r.ok) {
+      msg.textContent = '创建成功，ID: ' + d.id;
+      msg.className = 'msg ok';
+      form.reset();
+      onIpTypeChange(form.ip_type.value);
+      loadRules();
+    } else {
+      msg.textContent = '错误: ' + (d.error || JSON.stringify(d));
+      msg.className = 'msg err';
+    }
+  } catch(ex) {
+    msg.textContent = '网络错误: ' + ex.message;
+    msg.className = 'msg err';
+  }
+  btn.disabled = false;
+}
+
+function onIpTypeChange(val) {
+  document.getElementById('ip-cidr').style.display  = val === 'cidr'  ? 'flex' : 'none';
+  document.getElementById('ip-geoip').style.display = val === 'geoip' ? 'flex' : 'none';
+}
+
+loadStatus();
+loadRules();
+</script>
+</body>
+</html>

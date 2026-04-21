@@ -1,7 +1,7 @@
 use anyhow::Context as _;
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get},
     Json, Router,
@@ -342,13 +342,35 @@ struct StatusResponse {
     rule_count: usize,
 }
 
+// ========== 通用错误响应 ==========
+
+#[derive(serde::Serialize)]
+struct ErrResp {
+    error: String,
+}
+
+fn err(status: StatusCode, msg: impl Into<String>) -> axum::response::Response {
+    (status, Json(ErrResp { error: msg.into() })).into_response()
+}
+
+// ========== 静态资源 ==========
+
+static INDEX_HTML: &str = include_str!("index.html");
+
+async fn serve_index() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        INDEX_HTML,
+    )
+}
+
 // ========== API Handlers ==========
 
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     let rules = state.rules.lock().await;
     Json(StatusResponse {
         iface: state.iface.clone(),
-        api_version: "2.0",
+        api_version: "0.1.0",
         rule_count: rules.entries.len(),
     })
 }
@@ -373,18 +395,18 @@ async fn create_rule(
         IpConfig::Cidr { ip } => {
             let (ip_host, prefix_len) = match parse_cidr(ip) {
                 Some(x) => x,
-                None => return (StatusCode::BAD_REQUEST, "Invalid CIDR format").into_response(),
+                None => return err(StatusCode::BAD_REQUEST, "Invalid CIDR format"),
             };
             (IP_TYPE_CIDR, ip_host.to_be(), prefix_len, vec![])
         }
         IpConfig::Geoip { countries } => {
             if countries.is_empty() {
-                return (StatusCode::BAD_REQUEST, "countries list cannot be empty").into_response();
+                return err(StatusCode::BAD_REQUEST, "countries list cannot be empty");
             }
             let cidrs = match fetch_multiple_geoip(countries).await {
                 Ok(c) => c,
                 Err(e) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
                 }
             };
             (IP_TYPE_GEOIP, 0u32, 0u32, cidrs)
@@ -431,7 +453,7 @@ async fn create_rule(
     if let Err(e) = sync_rules(&mut ebpf, &rules_guard.entries) {
         warn!("同步规则失败: {}", e);
         rules_guard.entries.pop();
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     if ip_type == IP_TYPE_GEOIP {
         if let Err(e) = update_geoip(&mut ebpf, &rules_guard.entries) {
@@ -455,7 +477,7 @@ async fn delete_rule(
     let mut rules_guard = state.rules.lock().await;
     let pos = rules_guard.entries.iter().position(|e| e.id == id);
     match pos {
-        None => return (StatusCode::NOT_FOUND, "Rule not found").into_response(),
+        None => return err(StatusCode::NOT_FOUND, "Rule not found"),
         Some(i) => {
             rules_guard.entries.remove(i);
         }
@@ -464,7 +486,7 @@ async fn delete_rule(
     let mut ebpf = state.ebpf.lock().await;
     if let Err(e) = sync_rules(&mut ebpf, &rules_guard.entries) {
         warn!("同步规则失败: {}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
 
     info!("规则已删除: id={}", id);
@@ -493,6 +515,8 @@ struct Cli {
 
 async fn start_api(addr: &str, state: AppState) -> anyhow::Result<()> {
     let app = Router::new()
+        .route("/", get(serve_index))
+        .route("/index.html", get(serve_index))
         .route("/api/status", get(get_status))
         .route("/api/rules", get(list_rules).post(create_rule))
         .route("/api/rules/{id}", delete(delete_rule))

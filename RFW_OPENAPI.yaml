@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: RFW 防火墙 API
-  version: 2.1.0
+  version: 0.1.0
   description: |
     # RFW - 基于 eBPF/XDP 的高性能防火墙 API 文档
 
@@ -72,6 +72,7 @@ paths:
                 properties:
                   id:
                     type: integer
+                    format: int64
         '400':
           description: 参数错误
         '500':
@@ -88,6 +89,7 @@ paths:
           required: true
           schema:
             type: integer
+            format: int64
       responses:
         '200':
           description: 删除成功
@@ -172,6 +174,7 @@ components:
       properties:
         priority:
           type: integer
+          format: int32
           description: 优先级，值越大越优先匹配
         enabled:
           type: boolean
@@ -199,20 +202,28 @@ components:
       properties:
         id:
           type: integer
+          format: int64
         priority:
           type: integer
+          format: int32
         enabled:
           type: boolean
         direction:
-          type: string
+          $ref: '#/components/schemas/Direction'
         protocol:
-          type: string
+          $ref: '#/components/schemas/Protocol'
         port_start:
           type: integer
+          format: int32
+          minimum: 0
+          maximum: 65535
         port_end:
           type: integer
+          format: int32
+          minimum: 0
+          maximum: 65535
         action:
-          type: string
+          $ref: '#/components/schemas/Action'
       allOf:
         - $ref: '#/components/schemas/IpConfig'
 

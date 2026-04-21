@@ -53,10 +53,7 @@ pub fn rfw(ctx: XdpContext) -> u32 {
 pub fn rfw_egress(ctx: TcContext) -> i32 {
     let data = ctx.data() as *const u8;
     let data_end = ctx.data_end() as *const u8;
-    match try_rfw_egress(data, data_end) {
-        Ok(ret) => ret,
-        Err(_) => TC_ACT_PIPE,
-    }
+    try_rfw_egress(data, data_end).unwrap_or_else(|_| TC_ACT_PIPE)
 }
 
 fn try_rfw(data: *const u8, data_end: *const u8) -> Result<u32, ()> {
@@ -217,12 +214,12 @@ fn is_socks5_request(data: *const u8, data_end: *const u8, payload_offset: usize
     if start + 3 > data_end as usize { return false; }
     let p = start as *const u8;
     unsafe {
-        let nmethods = *p.add(1);
-        // version=0x05, nmethods 在合理范围 1-8, 且包长度足以容纳 method list
+        let methods = *p.add(1);
+        // version=0x05, methods 在合理范围 1-8, 且包长度足以容纳 method list
         *p == SOCKS5_VERSION
-            && nmethods >= 1
-            && nmethods <= 8
-            && start + 2 + nmethods as usize <= data_end as usize
+            && methods >= 1
+            && methods <= 8
+            && start + 2 + methods as usize <= data_end as usize
     }
 }
 
