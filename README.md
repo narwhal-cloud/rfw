@@ -49,10 +49,12 @@ sudo ./target/release/rfw --iface eth0 --api-addr 0.0.0.0:8080
 | 协议            | 说明                                        |
 |---------------|-------------------------------------------|
 | `tcp` / `udp` | 基础 L4 协议过滤                                |
-| `http`        | 识别常见的 HTTP 请求方法 (GET, POST, etc.)         |
-| `socks5`      | 识别 SOCKS5 代理握手特征                          |
-| `fet`         | Fully Encrypted Traffic (识别高熵、无明显特征的加密流量) |
+| `http`        | 识别常见的 HTTP 请求方法 (仅支持入口流量)         |
+| `socks5`      | 识别 SOCKS5 代理握手特征 (仅支持入口流量)                          |
+| `fet`         | Fully Encrypted Traffic (仅支持入口流量) |
 | `all`         | 匹配所有协议                                    |
+
+> **注意**: 应用层协议识别 (DPI) 目前仅在入口 (`in`) 方向生效。出口 (`out`) 方向的规则仅支持 `tcp`、`udp` 和 `all` 协议。
 
 ### 性能优化：连接跟踪与动作缓存
 

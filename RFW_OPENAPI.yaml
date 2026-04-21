@@ -109,9 +109,9 @@ components:
       description: |
         协议类型：
         - `tcp`/`udp`: 基础传输层协议
-        - `http`: 识别常见的 HTTP 方法特征
-        - `socks5`: 识别 SOCKS5 握手特征
-        - `fet`: Fully Encrypted Traffic (识别高熵加密流量，如混淆后的代理)
+        - `http`: 识别常见的 HTTP 方法特征 (仅支持 `direction: in`)
+        - `socks5`: 识别 SOCKS5 握手特征 (仅支持 `direction: in`)
+        - `fet`: Fully Encrypted Traffic (识别高熵加密流量，如混淆后的代理) (仅支持 `direction: in`)
         - `all`: 匹配所有协议
 
     Action:

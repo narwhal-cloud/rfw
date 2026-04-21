@@ -107,21 +107,17 @@ fn try_rfw_egress(data: *const u8, data_end: *const u8) -> Result<i32, ()> {
     let ihl = (unsafe { (*ip)._bitfield } & 0x0F) as usize * 4;
     if ihl < 20 || ihl > 60 { return Ok(TC_ACT_PIPE); }
 
-    let mut payload_offset = 14 + ihl;
+    let payload_offset = 14 + ihl;
     let (local_port, remote_port) = match protocol {
         IPPROTO_TCP => {
             let tcp = ptr_at::<TcpHdr>(data, data_end, payload_offset)?;
             let doff = ((u16::from_be(unsafe { (*tcp)._bitfield }) >> 12) & 0xF) as usize * 4;
             if doff < 20 || doff > 60 { return Err(()); }
-            let res = (u16::from_be(unsafe { (*tcp).source }), u16::from_be(unsafe { (*tcp).dest }));
-            payload_offset += doff;
-            res
+            (u16::from_be(unsafe { (*tcp).source }), u16::from_be(unsafe { (*tcp).dest }))
         }
         IPPROTO_UDP => {
             let udp = ptr_at::<UdpHdr>(data, data_end, payload_offset)?;
-            let res = (u16::from_be(unsafe { (*udp).source }), u16::from_be(unsafe { (*udp).dest }));
-            payload_offset += 8;
-            res
+            (u16::from_be(unsafe { (*udp).source }), u16::from_be(unsafe { (*udp).dest }))
         }
         _ => (0, 0),
     };
@@ -131,7 +127,7 @@ fn try_rfw_egress(data: *const u8, data_end: *const u8) -> Result<i32, ()> {
         return Ok(if action == ACTION_BLOCK { TC_ACT_SHOT } else { TC_ACT_PIPE });
     }
 
-    let app_proto = detect_app_proto(data, data_end, protocol, payload_offset);
+    let app_proto = 0;
     let action = apply_rules(remote_ip, protocol, app_proto, remote_port, DIR_OUT);
 
     if action == ACTION_BLOCK || app_proto != 0 { let _ = CONNTRACK.insert(&key, &action, 0); }

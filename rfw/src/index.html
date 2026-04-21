@@ -124,14 +124,14 @@
           </div>
           <div class="form-group">
             <label>方向</label>
-            <select name="direction">
+            <select name="direction" onchange="updateProtocolOptions(this.value)">
               <option value="in">in — 入站</option>
               <option value="out">out — 出站</option>
             </select>
           </div>
           <div class="form-group">
             <label>协议</label>
-            <select name="protocol">
+            <select name="protocol" id="protocol-select">
               <option value="all">all — 所有</option>
               <option value="tcp">tcp</option>
               <option value="udp">udp</option>
@@ -140,6 +140,7 @@
               <option value="fet">fet — 加密流量</option>
             </select>
           </div>
+
           <div class="form-group">
             <label>动作</label>
             <select name="action">
@@ -318,6 +319,21 @@ async function createRule(e) {
 function onIpTypeChange(val) {
   document.getElementById('ip-cidr').style.display  = val === 'cidr'  ? 'flex' : 'none';
   document.getElementById('ip-geoip').style.display = val === 'geoip' ? 'flex' : 'none';
+}
+
+function updateProtocolOptions(direction) {
+  const select = document.getElementById('protocol-select');
+  const appProtos = ['http', 'socks5', 'fet'];
+  
+  for (let opt of select.options) {
+    if (appProtos.includes(opt.value)) {
+      opt.hidden = (direction === 'out');
+      // 如果当前选中的是被隐藏的选项，切回到 'all'
+      if (opt.hidden && select.value === opt.value) {
+        select.value = 'all';
+      }
+    }
+  }
 }
 
 loadStatus();
