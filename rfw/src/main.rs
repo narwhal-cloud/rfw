@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use aya::maps::{Array, LpmTrie};
-use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpFlags};
+use aya::programs::{tc, SchedClassifier, TcAttachType, Xdp, XdpFlags};
 use aya::Ebpf;
 use clap::Parser;
 #[rustfmt::skip]
@@ -47,7 +47,7 @@ async fn fetch_geoip_data(country_code: &str) -> anyhow::Result<Vec<String>> {
     let cidrs: Vec<String> = text
         .lines()
         .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !l.contains(':')) // 只保留 IPv4，过滤 IPv6
         .collect();
 
     info!("已获取 {} 的 {} 条 CIDR", country_code.to_uppercase(), cidrs.len());
@@ -193,7 +193,7 @@ struct RuleEntry {
     cached_cidrs: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct RuleConfig {
     priority: u32,
     enabled: bool,
@@ -208,6 +208,21 @@ struct RuleConfig {
 struct RulesState {
     entries: Vec<RuleEntry>,
     next_id: u64,
+    /// 当前写入 GEOIP_MAP 的所有 key (ip_be, prefix_len)，用于全量清除
+    geoip_keys: Vec<(u32, u32)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedEntry {
+    id: u64,
+    config: RuleConfig,
+    cached_cidrs: Vec<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedState {
+    next_id: u64,
+    entries: Vec<PersistedEntry>,
 }
 
 #[derive(Clone)]
@@ -215,6 +230,71 @@ struct AppState {
     ebpf: Arc<Mutex<Ebpf>>,
     iface: String,
     rules: Arc<Mutex<RulesState>>,
+    rules_path: String,
+}
+
+// ========== 持久化 ==========
+
+fn rule_entry_from_persisted(p: PersistedEntry) -> RuleEntry {
+    let (ip_type, src_ip, src_prefix_len) = match &p.config.ip_config {
+        IpConfig::Any => (IP_TYPE_ANY, 0u32, 0u32),
+        IpConfig::Cidr { ip } => match parse_cidr(ip) {
+            Some((h, prefix)) => (IP_TYPE_CIDR, h.to_be(), prefix),
+            None => (IP_TYPE_CIDR, 0, 0),
+        },
+        IpConfig::Geoip { .. } => (IP_TYPE_GEOIP, 0, 0),
+    };
+    let rule = FirewallRule {
+        priority: p.config.priority,
+        enabled: if p.config.enabled { 1 } else { 0 },
+        direction: p.config.direction.to_u8(),
+        protocol: p.config.protocol.to_u8(),
+        action: p.config.action.to_u8(),
+        port_start: p.config.port_start,
+        port_end: p.config.port_end,
+        ip_type,
+        _padding: [0; 3],
+        src_ip,
+        src_prefix_len,
+    };
+    RuleEntry { id: p.id, rule, config: p.config, cached_cidrs: p.cached_cidrs }
+}
+
+fn save_rules(path: &str, state: &RulesState) {
+    let persisted = PersistedState {
+        next_id: state.next_id,
+        entries: state.entries.iter().map(|e| PersistedEntry {
+            id: e.id,
+            config: e.config.clone(),
+            cached_cidrs: e.cached_cidrs.clone(),
+        }).collect(),
+    };
+    match serde_json::to_string(&persisted) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, json) {
+                warn!("规则持久化写入失败: {}", e);
+            }
+        }
+        Err(e) => warn!("规则序列化失败: {}", e),
+    }
+}
+
+fn load_rules(path: &str) -> RulesState {
+    let json = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return RulesState { entries: Vec::new(), next_id: 0, geoip_keys: Vec::new() },
+    };
+    match serde_json::from_str::<PersistedState>(&json) {
+        Ok(p) => RulesState {
+            next_id: p.next_id,
+            entries: p.entries.into_iter().map(rule_entry_from_persisted).collect(),
+            geoip_keys: Vec::new(),
+        },
+        Err(e) => {
+            warn!("规则文件解析失败，使用空规则: {}", e);
+            RulesState { entries: Vec::new(), next_id: 0, geoip_keys: Vec::new() }
+        }
+    }
 }
 
 // ========== eBPF 同步 ==========
@@ -263,24 +343,38 @@ fn sync_rules(ebpf: &mut Ebpf, entries: &[RuleEntry]) -> anyhow::Result<()> {
 }
 
 
-fn update_geoip(ebpf: &mut Ebpf, entries: &[RuleEntry]) -> anyhow::Result<()> {
+fn update_geoip(ebpf: &mut Ebpf, state: &mut RulesState) -> anyhow::Result<()> {
     let mut geoip_map: LpmTrie<_, u32, u8> = ebpf
         .map_mut("GEOIP_MAP")
         .context("GEOIP_MAP not found")?
         .try_into()?;
 
-    for entry in entries {
+    // 全量清除上次写入的 key
+    for (ip_be, prefix_len) in state.geoip_keys.drain(..) {
+        let key = aya::maps::lpm_trie::Key::new(prefix_len, ip_be);
+        let _ = geoip_map.remove(&key);
+    }
+
+    // 合并所有 GeoIP 规则，只写 IPv4，去重
+    let mut seen = std::collections::HashSet::new();
+    for entry in &state.entries {
         if entry.rule.ip_type != IP_TYPE_GEOIP {
             continue;
         }
         for cidr in &entry.cached_cidrs {
             if let Some((ip_host, prefix_len)) = parse_cidr(cidr) {
-                let key = aya::maps::lpm_trie::Key::new(prefix_len, ip_host.to_be());
-                let _ = geoip_map.insert(&key, 1, 0);
+                let ip_be = ip_host.to_be();
+                if seen.insert((ip_be, prefix_len)) {
+                    let key = aya::maps::lpm_trie::Key::new(prefix_len, ip_be);
+                    if geoip_map.insert(&key, 1, 0).is_ok() {
+                        state.geoip_keys.push((ip_be, prefix_len));
+                    }
+                }
             }
         }
     }
 
+    info!("GEOIP_MAP 已更新: {} 条 IPv4 前缀", state.geoip_keys.len());
     Ok(())
 }
 
@@ -455,13 +549,12 @@ async fn create_rule(
         rules_guard.entries.pop();
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
-    if ip_type == IP_TYPE_GEOIP {
-        if let Err(e) = update_geoip(&mut ebpf, &rules_guard.entries) {
-            warn!("更新 GeoIP map 失败: {}", e);
-        }
+    if let Err(e) = update_geoip(&mut ebpf, &mut rules_guard) {
+        warn!("更新 GeoIP map 失败: {}", e);
     }
 
     info!("规则已创建: id={} priority={}", id, req.priority);
+    save_rules(&state.rules_path, &rules_guard);
     #[derive(serde::Serialize)]
     struct Resp {
         id: u64,
@@ -489,7 +582,12 @@ async fn delete_rule(
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
 
+    if let Err(e) = update_geoip(&mut ebpf, &mut rules_guard) {
+        warn!("更新 GeoIP map 失败: {}", e);
+    }
+
     info!("规则已删除: id={}", id);
+    save_rules(&state.rules_path, &rules_guard);
     StatusCode::OK.into_response()
 }
 
@@ -509,6 +607,10 @@ struct Cli {
     /// XDP 附加模式 (auto|skb|drv|hw)
     #[clap(long, default_value = "auto")]
     xdp_mode: String,
+
+    /// 规则持久化文件路径
+    #[clap(long, default_value = "rfw.json")]
+    rules_file: String,
 }
 
 // ========== 启动 ==========
@@ -553,24 +655,6 @@ async fn run_firewall(cli: Cli) -> anyhow::Result<()> {
     )))?;
     let ebpf = Arc::new(Mutex::new(ebpf));
 
-    // 初始化 eBPF 日志
-    {
-        let mut ebpf = ebpf.lock().await;
-        match aya_log::EbpfLogger::init(&mut ebpf) {
-            Err(e) => warn!("eBPF logger 初始化失败: {e}"),
-            Ok(logger) => {
-                let mut logger =
-                    tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-                tokio::task::spawn(async move {
-                    loop {
-                        let mut guard = logger.readable_mut().await.unwrap();
-                        guard.get_inner_mut().flush();
-                        guard.clear_ready();
-                    }
-                });
-            }
-        }
-    }
 
     // 附加 XDP 程序（入站）
     {
@@ -589,6 +673,7 @@ async fn run_firewall(cli: Cli) -> anyhow::Result<()> {
         info!("XDP 程序已附加到接口: {}", cli.iface);
 
         // 附加 TC 程序（出站）
+        let _ = tc::qdisc_add_clsact(&cli.iface); // 忽略"已存在"错误
         let tc_program: &mut SchedClassifier =
             ebpf.program_mut("rfw_egress").unwrap().try_into()?;
         tc_program.load()?;
@@ -599,13 +684,23 @@ async fn run_firewall(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    let mut initial_rules = load_rules(&cli.rules_file);
+    if !initial_rules.entries.is_empty() {
+        let mut ebpf_guard = ebpf.lock().await;
+        if let Err(e) = sync_rules(&mut ebpf_guard, &initial_rules.entries) {
+            warn!("加载持久化规则到 eBPF 失败: {}", e);
+        }
+        if let Err(e) = update_geoip(&mut ebpf_guard, &mut initial_rules) {
+            warn!("加载持久化 GeoIP 规则失败: {}", e);
+        }
+        info!("已加载 {} 条持久化规则", initial_rules.entries.len());
+    }
+
     let app_state = AppState {
         ebpf: ebpf.clone(),
         iface: cli.iface.clone(),
-        rules: Arc::new(Mutex::new(RulesState {
-            entries: Vec::new(),
-            next_id: 0,
-        })),
+        rules: Arc::new(Mutex::new(initial_rules)),
+        rules_path: cli.rules_file.clone(),
     };
 
     tokio::spawn({

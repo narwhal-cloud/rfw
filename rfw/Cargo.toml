@@ -10,7 +10,6 @@ rfw-common = { path = "../rfw-common", features = ["user"] }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
-aya-log = { workspace = true }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
@@ -24,7 +23,8 @@ tokio = { workspace = true, features = [
 clap = { workspace = true, features = ["derive"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0", features = ["derive"] }
-axum = { version = "0.8.8", features = ["macros"] }
+serde_json = "1.0"
+axum = { version = "0.8.9", features = ["macros"] }
 tower-http = { version = "0.6", features = ["cors"] }
 [build-dependencies]
 anyhow = { workspace = true }
