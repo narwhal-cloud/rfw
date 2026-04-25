@@ -186,6 +186,22 @@ fn is_fet(data: *const u8, data_end: *const u8, payload_offset: usize) -> bool {
     let start = data as usize + payload_offset;
     if start + 16 > data_end as usize { return false; }
     let p = start as *const u8;
+    // Ex2: 前6字节全为可打印 ASCII 则豁免（覆盖 SSH、SMTP 等明文协议）
+    let all_printable = unsafe {
+        let b0 = *p;
+        let b1 = *p.add(1);
+        let b2 = *p.add(2);
+        let b3 = *p.add(3);
+        let b4 = *p.add(4);
+        let b5 = *p.add(5);
+        b0 >= 0x20 && b0 <= 0x7e
+            && b1 >= 0x20 && b1 <= 0x7e
+            && b2 >= 0x20 && b2 <= 0x7e
+            && b3 >= 0x20 && b3 <= 0x7e
+            && b4 >= 0x20 && b4 <= 0x7e
+            && b5 >= 0x20 && b5 <= 0x7e
+    };
+    if all_printable { return false; }
     let mut ones: u32 = 0;
     let mut i = 0;
     while i < 16 {
