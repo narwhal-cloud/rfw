@@ -4,15 +4,15 @@
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{classifier, map, xdp},
-    maps::{lpm_trie::Key, Array, LpmTrie, LruHashMap},
+    maps::{lpm_trie::Key, Array, LpmTrie, LruHashMap, RingBuf},
     programs::{TcContext, XdpContext},
 };
 use core::mem::size_of;
 use rfw_common::{
-    ConnKey, FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, HTTP_CONNECT, HTTP_DELETE,
-    HTTP_GET, HTTP_HEAD, HTTP_OPTIONS, HTTP_PATCH, HTTP_POST, HTTP_PUT, IP_TYPE_ANY, IP_TYPE_CIDR,
-    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_FET, PROTO_HTTP, PROTO_SOCKS5, PROTO_TLS,
-    SOCKS5_VERSION,
+    BlockEvent, ConnKey, FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, HTTP_CONNECT,
+    HTTP_DELETE, HTTP_GET, HTTP_HEAD, HTTP_OPTIONS, HTTP_PATCH, HTTP_POST, HTTP_PUT, IP_TYPE_ANY,
+    IP_TYPE_CIDR, IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_FET, PROTO_HTTP, PROTO_SOCKS5,
+    PROTO_TLS, SOCKS5_VERSION,
 };
 
 #[map]
@@ -23,6 +23,9 @@ static GEOIP_MAP: LpmTrie<u32, u8> = LpmTrie::with_max_entries(65536, 0);
 
 #[map]
 static CONNTRACK: LruHashMap<ConnKey, u8> = LruHashMap::with_max_entries(16384, 0);
+
+#[map]
+static BLOCK_EVENTS: RingBuf = RingBuf::with_byte_size(1 << 16, 0);
 
 #[repr(C)]
 struct EthHdr { h_dest: [u8; 6], h_source: [u8; 6], h_proto: u16 }
@@ -91,9 +94,22 @@ fn try_rfw(data: *const u8, data_end: *const u8) -> Result<u32, ()> {
     }
 
     let app_proto = detect_app_proto(data, data_end, protocol, payload_offset);
-    let action = apply_rules(remote_ip, protocol, app_proto, local_port, DIR_IN);
+    let (action, rule_idx) = apply_rules(remote_ip, protocol, app_proto, local_port, DIR_IN);
 
-    if action == ACTION_BLOCK || app_proto != 0 { let _ = CONNTRACK.insert(&key, &action, 0); }
+    // 有 payload 才缓存：SYN/ACK 等无 payload 的包不缓存，保证 HTTP/GeoIP 等应用层规则能正确命中首个数据包
+    let has_payload = payload_offset < (data_end as usize - data as usize);
+    // 识别到应用层协议或被阻断时发送事件（用于调试）
+    if action == ACTION_BLOCK || app_proto != 0 {
+        let _ = BLOCK_EVENTS.output::<BlockEvent>(&BlockEvent {
+            src_ip: remote_ip, dst_ip: local_ip,
+            src_port: remote_port, dst_port: local_port,
+            protocol, app_proto, direction: DIR_IN,
+            rule_idx: rule_idx as u8, action, _pad: 0,
+        }, 0);
+    }
+    if action == ACTION_BLOCK || app_proto != 0 || has_payload {
+        let _ = CONNTRACK.insert(&key, &action, 0);
+    }
     Ok(if action == ACTION_BLOCK { xdp_action::XDP_DROP } else { xdp_action::XDP_PASS })
 }
 
@@ -127,10 +143,18 @@ fn try_rfw_egress(data: *const u8, data_end: *const u8) -> Result<i32, ()> {
         return Ok(if action == ACTION_BLOCK { TC_ACT_SHOT } else { TC_ACT_PIPE });
     }
 
-    let app_proto = 0;
-    let action = apply_rules(remote_ip, protocol, app_proto, remote_port, DIR_OUT);
+    let app_proto = 0u8;
+    let (action, rule_idx) = apply_rules(remote_ip, protocol, app_proto, remote_port, DIR_OUT);
 
-    if action == ACTION_BLOCK || app_proto != 0 { let _ = CONNTRACK.insert(&key, &action, 0); }
+    if action == ACTION_BLOCK {
+        let _ = BLOCK_EVENTS.output::<BlockEvent>(&BlockEvent {
+            src_ip: local_ip, dst_ip: remote_ip,
+            src_port: local_port, dst_port: remote_port,
+            protocol, app_proto, direction: DIR_OUT,
+            rule_idx: rule_idx as u8, action, _pad: 0,
+        }, 0);
+        let _ = CONNTRACK.insert(&key, &action, 0);
+    }
     Ok(if action == ACTION_BLOCK { TC_ACT_SHOT } else { TC_ACT_PIPE })
 }
 
@@ -140,13 +164,13 @@ fn detect_app_proto(data: *const u8, data_end: *const u8, protocol: u8, payload_
     if is_tls(data, data_end, payload_offset) { return PROTO_TLS; }
     if is_http_request(data, data_end, payload_offset) { return PROTO_HTTP; }
     if is_socks5_request(data, data_end, payload_offset) { return PROTO_SOCKS5; }
-    // FET 判断在 plain_text 之前：高熵数据优先识别为加密流量
+    // is_fet 内部已做明文豁免：前6字节全为可打印ASCII则直接返回false，确保高熵数据才被识别为加密流量（FET）
     if is_fet(data, data_end, payload_offset) { return PROTO_FET; }
     0
 }
 
 #[inline(always)]
-fn apply_rules(remote_ip: u32, protocol: u8, app_proto: u8, port: u16, direction: u8) -> u8 {
+fn apply_rules(remote_ip: u32, protocol: u8, app_proto: u8, port: u16, direction: u8) -> (u8, u32) {
     for i in 0..MAX_RULES {
         let rule = match RULES.get(i) { Some(r) => r, None => break };
         if rule.enabled == 0 { break; }
@@ -168,9 +192,9 @@ fn apply_rules(remote_ip: u32, protocol: u8, app_proto: u8, port: u16, direction
             }
             _ => false,
         };
-        if ip_ok { return rule.action; }
+        if ip_ok { return (rule.action, i); }
     }
-    ACTION_PASS
+    (ACTION_PASS, MAX_RULES)
 }
 
 #[inline(always)]
@@ -178,7 +202,7 @@ fn is_tls(data: *const u8, data_end: *const u8, payload_offset: usize) -> bool {
     let start = data as usize + payload_offset;
     if start + 3 > data_end as usize { return false; }
     let p = start as *const u8;
-    unsafe { *p == 0x16 && *p.add(1) == 0x03 && *p.add(2) <= 0x03 }
+    unsafe { *p >= 0x16 && *p <= 0x17 && *p.add(1) == 0x03 && *p.add(2) <= 0x09 }
 }
 
 #[inline(always)]
@@ -208,7 +232,20 @@ fn is_fet(data: *const u8, data_end: *const u8, payload_offset: usize) -> bool {
         ones += unsafe { (*p.add(i)).count_ones() };
         i += 1;
     }
-    ones >= 54 && ones <= 74
+    // 尝试扩展到32字节以提高精度（与旧版行为一致）
+    let check_len = if start + 32 <= data_end as usize {
+        let mut j = 16;
+        while j < 32 {
+            ones += unsafe { (*p.add(j)).count_ones() };
+            j += 1;
+        }
+        32u32
+    } else {
+        16u32
+    };
+    // 开区间 (3.4, 4.6) bits/byte，对应旧版 avg_x100 > 340 && avg_x100 < 460
+    let avg_x100 = (ones * 100) / check_len;
+    avg_x100 > 340 && avg_x100 < 460
 }
 
 #[inline(always)]

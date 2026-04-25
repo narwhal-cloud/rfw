@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use std::mem::size_of;
 use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
@@ -6,15 +7,16 @@ use axum::{
     routing::{delete, get},
     Json, Router,
 };
-use aya::maps::{Array, LpmTrie};
+use aya::maps::{Array, LpmTrie, RingBuf};
 use aya::programs::{tc, SchedClassifier, TcAttachType, Xdp, XdpFlags};
 use aya::Ebpf;
 use clap::Parser;
 #[rustfmt::skip]
 use log::{debug, info, warn};
 use rfw_common::{
-    FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, IP_TYPE_ANY, IP_TYPE_CIDR,
-    IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_FET, PROTO_HTTP, PROTO_SOCKS5, PROTO_TCP, PROTO_UDP,
+    BlockEvent, FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, IP_TYPE_ANY,
+    IP_TYPE_CIDR, IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_FET, PROTO_HTTP, PROTO_SOCKS5,
+    PROTO_TCP, PROTO_TLS, PROTO_UDP,
 };
 use std::sync::Arc;
 use tokio::signal;
@@ -23,12 +25,12 @@ use tower_http::cors::CorsLayer;
 
 // ========== GeoIP 数据获取 ==========
 
-async fn fetch_geoip_data(country_code: &str) -> anyhow::Result<Vec<String>> {
+async fn download_geoip(country_code: &str) -> anyhow::Result<Vec<String>> {
     const GEOIP_URL_TEMPLATE: &str =
         "https://raw.githubusercontent.com/Loyalsoldier/geoip/refs/heads/release/text/{}.txt";
 
     let url = GEOIP_URL_TEMPLATE.replace("{}", &country_code.to_lowercase());
-    info!("正在下载 {} 的 GeoIP 数据: {}", country_code.to_uppercase(), url);
+    info!("下载 GeoIP {} ...", country_code);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -36,28 +38,49 @@ async fn fetch_geoip_data(country_code: &str) -> anyhow::Result<Vec<String>> {
 
     let response = client.get(&url).send().await?;
     if !response.status().is_success() {
-        anyhow::bail!(
-            "下载 {} GeoIP 数据失败: HTTP {}",
-            country_code,
-            response.status()
-        );
+        anyhow::bail!("下载 {} GeoIP 失败: HTTP {}", country_code, response.status());
     }
 
     let text = response.text().await?;
     let cidrs: Vec<String> = text
         .lines()
         .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && !l.contains(':')) // 只保留 IPv4，过滤 IPv6
+        .filter(|l| !l.is_empty() && !l.contains(':')) // 只保留 IPv4
         .collect();
 
-    info!("已获取 {} 的 {} 条 CIDR", country_code.to_uppercase(), cidrs.len());
+    info!("GeoIP {} 下载完成: {} 条前缀", country_code, cidrs.len());
     Ok(cidrs)
 }
 
-async fn fetch_multiple_geoip(country_codes: &[String]) -> anyhow::Result<Vec<String>> {
+/// 加载单个国家的 GeoIP 数据：优先读本地缓存，缓存不存在时下载并写入缓存
+async fn load_geoip_country(code: &str, geoip_dir: &str) -> anyhow::Result<Vec<String>> {
+    let code = code.to_uppercase();
+    let cache_path = format!("{}/{}.txt", geoip_dir, code);
+
+    if let Ok(content) = std::fs::read_to_string(&cache_path) {
+        let cidrs: Vec<String> = content
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !cidrs.is_empty() {
+            info!("GeoIP {} 从缓存加载: {} 条前缀", code, cidrs.len());
+            return Ok(cidrs);
+        }
+    }
+
+    // 缓存不存在或为空，下载并写入缓存
+    let cidrs = download_geoip(&code).await?;
+    if let Err(e) = std::fs::write(&cache_path, cidrs.join("\n")) {
+        warn!("GeoIP {} 写入缓存失败: {}", code, e);
+    }
+    Ok(cidrs)
+}
+
+async fn fetch_multiple_geoip(country_codes: &[String], geoip_dir: &str) -> anyhow::Result<Vec<String>> {
     let mut all_cidrs = Vec::new();
     for code in country_codes {
-        match fetch_geoip_data(&code.to_uppercase()).await {
+        match load_geoip_country(code, geoip_dir).await {
             Ok(cidrs) => all_cidrs.extend(cidrs),
             Err(e) => warn!("获取 {} GeoIP 数据失败: {}", code, e),
         }
@@ -216,7 +239,7 @@ struct RulesState {
 struct PersistedEntry {
     id: u64,
     config: RuleConfig,
-    cached_cidrs: Vec<String>,
+    // cached_cidrs 不再序列化，启动时根据 countries code 重新拉取
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -231,6 +254,7 @@ struct AppState {
     iface: String,
     rules: Arc<Mutex<RulesState>>,
     rules_path: String,
+    geoip_dir: String,
 }
 
 // ========== 持久化 ==========
@@ -257,7 +281,23 @@ fn rule_entry_from_persisted(p: PersistedEntry) -> RuleEntry {
         src_ip,
         src_prefix_len,
     };
-    RuleEntry { id: p.id, rule, config: p.config, cached_cidrs: p.cached_cidrs }
+    RuleEntry { id: p.id, rule, config: p.config, cached_cidrs: vec![] }
+}
+
+async fn refresh_geoip_caches(entries: &mut Vec<RuleEntry>, geoip_dir: &str) {
+    for entry in entries.iter_mut() {
+        if let IpConfig::Geoip { countries } = &entry.config.ip_config {
+            if !countries.is_empty() {
+                match fetch_multiple_geoip(countries, geoip_dir).await {
+                    Ok(cidrs) => {
+                        info!("GeoIP rule#{} 已拉取 {} 条前缀", entry.id, cidrs.len());
+                        entry.cached_cidrs = cidrs;
+                    }
+                    Err(e) => warn!("GeoIP rule#{} 拉取失败: {}", entry.id, e),
+                }
+            }
+        }
+    }
 }
 
 fn save_rules(path: &str, state: &RulesState) {
@@ -266,7 +306,6 @@ fn save_rules(path: &str, state: &RulesState) {
         entries: state.entries.iter().map(|e| PersistedEntry {
             id: e.id,
             config: e.config.clone(),
-            cached_cidrs: e.cached_cidrs.clone(),
         }).collect(),
     };
     match serde_json::to_string(&persisted) {
@@ -497,7 +536,7 @@ async fn create_rule(
             if countries.is_empty() {
                 return err(StatusCode::BAD_REQUEST, "countries list cannot be empty");
             }
-            let cidrs = match fetch_multiple_geoip(countries).await {
+            let cidrs = match fetch_multiple_geoip(countries, &state.geoip_dir).await {
                 Ok(c) => c,
                 Err(e) => {
                     return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -611,6 +650,10 @@ struct Cli {
     /// 规则持久化文件路径
     #[clap(long, default_value = "rfw.json")]
     rules_file: String,
+
+    /// GeoIP 缓存目录
+    #[clap(long, default_value = "geoip")]
+    geoip_dir: String,
 }
 
 // ========== 启动 ==========
@@ -649,12 +692,20 @@ async fn run_firewall(cli: Cli) -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    let ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/rfw"
     )))?;
+    // 取出 RingBuf map，启动阻断事件日志任务
+    let block_events_map = ebpf.take_map("BLOCK_EVENTS");
     let ebpf = Arc::new(Mutex::new(ebpf));
 
+    if let Some(map) = block_events_map {
+        match RingBuf::try_from(map) {
+            Ok(ring) => { tokio::spawn(drain_block_events(ring)); }
+            Err(e) => warn!("RingBuf init failed: {e}"),
+        }
+    }
 
     // 附加 XDP 程序（入站）
     {
@@ -684,8 +735,25 @@ async fn run_firewall(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // 启动时清空 GeoIP 缓存目录，确保每次拉取最新数据
+    if std::path::Path::new(&cli.geoip_dir).exists() {
+        if let Ok(rd) = std::fs::read_dir(&cli.geoip_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("txt") {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
+    if let Err(e) = std::fs::create_dir_all(&cli.geoip_dir) {
+        warn!("创建 GeoIP 缓存目录失败: {}", e);
+    }
+
     let mut initial_rules = load_rules(&cli.rules_file);
     if !initial_rules.entries.is_empty() {
+        // GeoIP 规则只持久化 country code，启动时重新拉取 CIDR（优先读本地缓存）
+        refresh_geoip_caches(&mut initial_rules.entries, &cli.geoip_dir).await;
         let mut ebpf_guard = ebpf.lock().await;
         if let Err(e) = sync_rules(&mut ebpf_guard, &initial_rules.entries) {
             warn!("加载持久化规则到 eBPF 失败: {}", e);
@@ -701,6 +769,7 @@ async fn run_firewall(cli: Cli) -> anyhow::Result<()> {
         iface: cli.iface.clone(),
         rules: Arc::new(Mutex::new(initial_rules)),
         rules_path: cli.rules_file.clone(),
+        geoip_dir: cli.geoip_dir.clone(),
     };
 
     tokio::spawn({
@@ -719,4 +788,52 @@ async fn run_firewall(cli: Cli) -> anyhow::Result<()> {
     signal::ctrl_c().await?;
     println!("退出中...");
     Ok(())
+}
+
+async fn drain_block_events(mut ring: RingBuf<aya::maps::MapData>) {
+    use std::net::Ipv4Addr;
+    use std::os::fd::AsFd;
+    use tokio::io::unix::AsyncFd;
+
+    let fd = match AsyncFd::new(ring.as_fd().try_clone_to_owned().unwrap()) {
+        Ok(f) => f,
+        Err(e) => { warn!("block_events AsyncFd: {e}"); return; }
+    };
+
+    loop {
+        match fd.readable().await {
+            Err(e) => { warn!("block_events poll: {e}"); break; }
+            Ok(mut guard) => {
+                guard.clear_ready();
+                while let Some(item) = ring.next() {
+                    if item.len() < size_of::<BlockEvent>() { continue; }
+                    let ev = unsafe { &*(item.as_ptr() as *const BlockEvent) };
+                    let dir = if ev.direction == DIR_IN { "IN " } else { "OUT" };
+                    let app = match ev.app_proto {
+                        PROTO_FET    => "FET",
+                        PROTO_HTTP   => "HTTP",
+                        PROTO_TLS    => "TLS",
+                        PROTO_SOCKS5 => "SOCKS5",
+                        _            => "-",
+                    };
+                    let l4 = match ev.protocol {
+                        6  => "TCP",
+                        17 => "UDP",
+                        _  => "?",
+                    };
+                    let verdict = if ev.action == ACTION_BLOCK { "BLOCK" } else { "PASS " };
+                    let rule_info = if ev.rule_idx as u32 == MAX_RULES {
+                        "no-rule".to_string()
+                    } else {
+                        format!("rule={}", ev.rule_idx)
+                    };
+                    info!("[{} {}] {}:{} -> {}:{} l4={} app={} {}",
+                        verdict, dir,
+                        Ipv4Addr::from(u32::from_be(ev.src_ip)), ev.src_port,
+                        Ipv4Addr::from(u32::from_be(ev.dst_ip)), ev.dst_port,
+                        l4, app, rule_info);
+                }
+            }
+        }
+    }
 }

@@ -75,6 +75,26 @@ pub struct FirewallRule {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FirewallRule {}
 
+/// eBPF 向用户态发送的连接事件（通过 RingBuf）
+/// 仅在应用层协议被识别或连接被阻断时发送
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BlockEvent {
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub protocol: u8,
+    pub app_proto: u8,
+    pub direction: u8,
+    pub rule_idx: u8,
+    pub action: u8,   // ACTION_BLOCK / ACTION_PASS
+    pub _pad: u8,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for BlockEvent {}
+
 /// LpmTrie Key 结构 - 用于 GeoIP 前缀匹配
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
