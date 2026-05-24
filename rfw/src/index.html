@@ -136,8 +136,13 @@
               <option value="tcp">tcp</option>
               <option value="udp">udp</option>
               <option value="http">http</option>
-              <option value="socks5">socks5</option>
+              <option value="tls">tls — TLS/HTTPS 握手</option>
+              <option value="socks">socks — SOCKS4/5</option>
+              <option value="ssh">ssh — SSH 隧道</option>
               <option value="fet">fet — 加密流量</option>
+              <option value="wireguard">wireguard — WireGuard VPN</option>
+              <option value="openvpn">openvpn — OpenVPN</option>
+              <option value="quic">quic — QUIC/HTTP3</option>
             </select>
           </div>
 
@@ -323,7 +328,7 @@ function onIpTypeChange(val) {
 
 function updateProtocolOptions(direction) {
   const select = document.getElementById('protocol-select');
-  const appProtos = ['http', 'socks5', 'fet'];
+  const appProtos = ['http', 'tls', 'socks', 'ssh', 'fet', 'wireguard', 'openvpn', 'quic'];
   
   for (let opt of select.options) {
     if (appProtos.includes(opt.value)) {

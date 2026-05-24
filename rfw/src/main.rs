@@ -15,8 +15,8 @@ use clap::Parser;
 use log::{debug, info, warn};
 use rfw_common::{
     BlockEvent, FirewallRule, ACTION_BLOCK, ACTION_PASS, DIR_IN, DIR_OUT, IP_TYPE_ANY,
-    IP_TYPE_CIDR, IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_FET, PROTO_HTTP, PROTO_SOCKS5,
-    PROTO_TCP, PROTO_TLS, PROTO_UDP,
+    IP_TYPE_CIDR, IP_TYPE_GEOIP, MAX_RULES, PROTO_ALL, PROTO_FET, PROTO_HTTP, PROTO_OPENVPN,
+    PROTO_QUIC, PROTO_SOCKS, PROTO_SSH, PROTO_TCP, PROTO_TLS, PROTO_UDP, PROTO_WIREGUARD,
 };
 use std::sync::Arc;
 use tokio::signal;
@@ -147,8 +147,14 @@ enum Protocol {
     Tcp,
     Udp,
     Http,
-    Socks5,
+    Tls,
+    #[serde(alias = "socks5")]
+    Socks,
+    Ssh,
     Fet,
+    Wireguard,
+    Openvpn,
+    Quic,
     All,
 }
 
@@ -158,8 +164,13 @@ impl Protocol {
             Self::Tcp => PROTO_TCP,
             Self::Udp => PROTO_UDP,
             Self::Http => PROTO_HTTP,
-            Self::Socks5 => PROTO_SOCKS5,
+            Self::Tls => PROTO_TLS,
+            Self::Socks => PROTO_SOCKS,
+            Self::Ssh => PROTO_SSH,
             Self::Fet => PROTO_FET,
+            Self::Wireguard => PROTO_WIREGUARD,
+            Self::Openvpn => PROTO_OPENVPN,
+            Self::Quic => PROTO_QUIC,
             Self::All => PROTO_ALL,
         }
     }
@@ -168,8 +179,13 @@ impl Protocol {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
             Self::Http => "http",
-            Self::Socks5 => "socks5",
+            Self::Tls => "tls",
+            Self::Socks => "socks",
+            Self::Ssh => "ssh",
             Self::Fet => "fet",
+            Self::Wireguard => "wireguard",
+            Self::Openvpn => "openvpn",
+            Self::Quic => "quic",
             Self::All => "all",
         }
     }
@@ -810,11 +826,15 @@ async fn drain_block_events(mut ring: RingBuf<aya::maps::MapData>) {
                     let ev = unsafe { &*(item.as_ptr() as *const BlockEvent) };
                     let dir = if ev.direction == DIR_IN { "IN " } else { "OUT" };
                     let app = match ev.app_proto {
-                        PROTO_FET    => "FET",
-                        PROTO_HTTP   => "HTTP",
-                        PROTO_TLS    => "TLS",
-                        PROTO_SOCKS5 => "SOCKS5",
-                        _            => "-",
+                        PROTO_FET       => "FET",
+                        PROTO_HTTP      => "HTTP",
+                        PROTO_TLS       => "TLS",
+                        PROTO_SOCKS     => "SOCKS",
+                        PROTO_SSH       => "SSH",
+                        PROTO_WIREGUARD => "WireGuard",
+                        PROTO_OPENVPN   => "OpenVPN",
+                        PROTO_QUIC      => "QUIC",
+                        _               => "-",
                     };
                     let l4 = match ev.protocol {
                         6  => "TCP",

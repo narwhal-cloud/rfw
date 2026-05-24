@@ -105,13 +105,18 @@ components:
 
     Protocol:
       type: string
-      enum: [tcp, udp, http, socks5, fet, all]
+      enum: [tcp, udp, http, tls, socks, ssh, fet, wireguard, openvpn, quic, all]
       description: |
-        协议类型：
+        协议类型（应用层协议均基于首包特征匹配，仅支持 `direction: in`）：
         - `tcp`/`udp`: 基础传输层协议
-        - `http`: 识别常见的 HTTP 方法特征 (仅支持 `direction: in`)
-        - `socks5`: 识别 SOCKS5 握手特征 (仅支持 `direction: in`)
-        - `fet`: Fully Encrypted Traffic (识别高熵加密流量，如混淆后的代理) (仅支持 `direction: in`)
+        - `http`: 识别常见的 HTTP 方法特征
+        - `tls`: 识别 TLS/SSL 握手特征 (ContentType 0x16/0x17 + 版本号)
+        - `socks`: 识别 SOCKS4/SOCKS4a/SOCKS5 握手特征（兼容旧值 `socks5`，输入 `socks5` 等价于 `socks`）
+        - `ssh`: 识别 SSH 标识串 ("SSH-")，常用于 `ssh -D` 隧道代理
+        - `fet`: Fully Encrypted Traffic (识别高熵加密流量，如混淆后的代理)
+        - `wireguard`: 识别 WireGuard VPN 握手包 (UDP，定长 148/92 字节)
+        - `openvpn`: 识别 OpenVPN 控制握手包 (TCP/UDP，HARD_RESET opcode)
+        - `quic`: 识别 QUIC/HTTP-3 长头部首包 (UDP，v1/v2/draft/Google QUIC)
         - `all`: 匹配所有协议
 
     Action:

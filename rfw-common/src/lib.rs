@@ -15,8 +15,12 @@ pub const PROTO_UDP: u8 = 17;
 // 应用层协议（自定义编号，128+ 避免与 IANA IPPROTO 冲突）
 pub const PROTO_HTTP: u8 = 128;
 pub const PROTO_TLS: u8 = 129;
-pub const PROTO_SOCKS5: u8 = 130;
+pub const PROTO_SOCKS: u8 = 130; // SOCKS4 / SOCKS4a / SOCKS5（统一识别，旧值 SOCKS5 沿用此编号）
 pub const PROTO_FET: u8 = 131; // Fully Encrypted Traffic
+pub const PROTO_WIREGUARD: u8 = 132; // WireGuard VPN (UDP)
+pub const PROTO_SSH: u8 = 133; // SSH (常用于 -D 隧道代理)
+pub const PROTO_OPENVPN: u8 = 134; // OpenVPN (TCP/UDP)
+pub const PROTO_QUIC: u8 = 135; // QUIC / HTTP-3 (UDP)
 
 /// 连接跟踪 Key (5-tuple)
 #[repr(C)]
@@ -45,6 +49,8 @@ pub const HTTP_PATCH: u32 = 0x50415443;   // "PATC"
 pub const HTTP_CONNECT: u32 = 0x434F4E4E; // "CONN"
 
 pub const SOCKS5_VERSION: u8 = 0x05;
+pub const SOCKS4_VERSION: u8 = 0x04;
+pub const SSH_BANNER: u32 = 0x5353482D; // "SSH-"
 
 // 动作
 pub const ACTION_BLOCK: u8 = 0;
