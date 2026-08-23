@@ -37,4 +37,4 @@ strip = true
 
 [profile.release.package.rfw-ebpf]
 debug = 0
-opt-level = "z"
+opt-level = 2
